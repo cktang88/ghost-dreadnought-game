@@ -13,7 +13,7 @@
 - Flight-plane objects use `engine.toFlight(x, y, alt)`. Ground objects use `engine.toGround(x, y)` and must be scaled by `engine.groundScale`.
 - Ship hulls are `SECTIONS` design units × `SHIP_SCALE` (3.1; it was 2.6 before the scale pass). `derive()` already returns scaled rects and mounts.
 - The city is authored in its own design units and shrunk by `CITY_K` (0.25) into field units (`src/game/worldgen.ts`, see "City").
-- **True scale: one world unit is one metre.** A finished hull is 330-370 field units (a 330 m carrier); aircraft fly on the flight plane,
+- **True scale: one world unit is one metre.** A finished hull is 330-550 field units long and under 100 wide; aircraft fly on the flight plane,
   so a 19 m interceptor is 19 field units; a ground object of m metres covers m / groundScale (~1.65) field units, so a 10 m tank is ~6.
   Enemy models are drawn at `TRUE_M[type]` metres (`src/render/units/scale.ts`; `UnitSpec.scale` is computed from each model's extent).
   Gameplay radii (`EN[type].r`) are unchanged and decoupled from the drawing: they were already generous, and now act as the marker radius.
@@ -78,24 +78,43 @@ Renderers read it every frame; nothing here needs to be written by them.
 - `tx, ty` pointer-steer target (null when keys steer). Movement math: `src/game/feel.ts` (`stepShipVelocity`, `arriveWish`, `stepBank`).
 - Bounds: the whole 1600×900 field minus the hull's half size (56 units kept clear at the top for the HUD).
 
-### Firing arcs, traverse and target layers (`src/data/parts.ts`)
-Where a gun is mounted decides where it can point and what it can hit:
+### Firing arcs, facing, hull shadows and target layers (`src/data/parts.ts`)
+Where a gun is mounted, which way it faces and what stands around it decide where it can point and what it can hit.
 
-| Arc | Mounts | Traverse (ship space, 0 = bow) | Engages |
-| --- | --- | --- | --- |
-| `bow` | Command Bridge | forward cone ±`TRAVERSE.bow` (0.75 rad) | air and ground |
-| `dorsal` | Gun Deck turrets (top deck) | all round | air only (aircraft and ghost dreadnoughts): they cannot depress below the hull |
-| `broadside` | Broadside Battery | its flank ±`TRAVERSE.broadside` (1.0 rad) about the beam; the centre mount either flank | air and ground |
-| `ventral` | any bomb bay or mortar | falls (`down: true`) | ground only; a flying ghost is out of reach |
-| `omni` | point defense, arc coils | all round | PD: enemy fire (`shots`); coils: air from the top deck, air and ground elsewhere |
+**Hull shape.** Sections are long and narrow (`SECTIONS[t].w` is the beam, `h` the length along the keel; the hull proper is
+`HULL_BEAM` wide, a battery's sponsons stand out of it). A starter is ~229 × 93 field units, an eight-section ship ~550 long, so
+section order really moves guns along the keel. `slotPos(type, i)` places mounts: the bridge gun ahead of the tower, Gun Deck turrets
+on the centreline fore and aft, battery sponsons port and starboard with a centreline casemate between. Any section, the bridge too,
+may sit anywhere in the order.
 
-- Every `Mount` has `arc`, `side: -1 | 0 | 1` (broadside port/starboard, 0 = either) and `trav: Traverse` =
-  `mountTraverse(sectionType, slotKind, partId, side)`: `{ arc, sectors: { c, h }[], layers, down }`. Sector angles are in SHIP space
+**Facing.** Every weapon mount has a facing (`Facing` 0..7, 45° steps clockwise from the bow: 0 bow, 2 starboard, 4 stern, 6 port),
+stored per slot in `Section.face` (it belongs to the mount, not the part). `allowedFacings(type, i)`, `defaultFacing`,
+`mountFacing(section, i)`, `nextFacing` and `rotateMount` (refitLogic.ts) handle it. The arc is centred on the facing:
+
+| Arc | Mounts | Facings | Traverse about the facing | Engages |
+| --- | --- | --- | --- | --- |
+| `bow` | Command Bridge | fore, fore-port, fore-starboard | ±`TRAVERSE.bow` (0.8 rad), clipped to the forward half | air and ground |
+| `dorsal` | Gun Deck turrets (top deck) | any | ±`TRAVERSE.dorsal` (2.1 rad, 240°) | air only: they cannot depress below the hull |
+| `broadside` | Broadside Battery | outboard on its side: fore / abeam / aft quarter (the centre casemate either side) | ±`TRAVERSE.broadside` (1.05 rad), clipped to its own side | air and ground |
+| `ventral` | any bomb bay or mortar | ignored | falls (`down: true`) | ground only; a flying ghost is out of reach |
+| `omni` | point defense, arc coils | ignored | all round | PD: enemy fire (`shots`); coils: air from the top deck, air and ground elsewhere |
+
+**Hull shadows.** `hullObstacles(rects)` lists what stands in the way: the bridge tower and engine funnels (tall: they block the bridge
+gun and top-deck turrets of other sections) and battery sponsons (wide: they block sponsons on the same side of other batteries).
+`hullShadows(trav, x, y, si, obstacles)` removes the bearings each obstacle subtends from the mount (a turret right behind the tower
+loses about ±31° dead ahead, one far aft only a few degrees), so sectors can come out in two pieces, and records them in
+`trav.blocked` (`{ c, h, by }`). `Derived.obstacles` keeps the list; `traverseIn(d, si, i, partId)` previews a part in a mount.
+
+- Every `Mount` has `facing`, `arc`, `side: -1 | 0 | 1` (broadside port/starboard from its facing; 0 for other arcs) and
+  `trav: Traverse` = `mountTraverse(sectionType, slotKind, partId, facing)` masked by `hullShadows`:
+  `{ arc, sectors: { c, h }[], layers, down, blocked }`. Sector angles are in SHIP space
   (radians, 0 = dead ahead, +PI/2 = starboard). `shipToField(a, mirrored)` / `fieldToShip` convert (the player's bow points up the
   screen, a ghost's down: `mirrored = true`), `inTraverse(trav, fieldAngle, mirrored)` tests a bearing and
   `clampTraverse(trav, fieldAngle, mirrored)` clamps one into the nearest sector. The ship renderer should clamp turret yaw with the same
   helpers. `layersHit(layers, enemyLayer)` decides what a mount may engage (a ghost dreadnought is layer `both`: air guns reach it,
   ground ordnance does not). `LAYERS_TAG` gives the HUD / refit tag (AIR, GND, ALL, PD). `placementNote(partId)` is the part slip line.
+- Ghosts carry facings (`GhostSections[].face`, validated 0..7 by `server/validate.mjs`; the client falls back to the default where a
+  facing is not allowed). Older ghosts without `face` get the defaults.
 - `ARC_INFO[arc]` gives `label`, `short`, `col` and `desc` for the UI. `positionArc(sectionType, slotKind)` is the arc a mount position
   gives (bridge bow, gun deck dorsal, battery broadside); `mountArc(sectionType, slotKind, partId)` the effective arc (bombs and mortars
   are always ventral, arc coils and PD omni).
