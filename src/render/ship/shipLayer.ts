@@ -8,7 +8,7 @@ import { FIELD_W, FIELD_H } from '../engine';
 import { buildToGhost, derive, starterBuild, type Derived } from '../../data/parts';
 import { rgb, Shape, DarkShape } from '../fx/quads';
 const DRONE_HULL = rgb('#2a3038');
-import { clamp, angDiff } from '../../util/rng';
+import { clamp } from '../../util/rng';
 import { dronePos, fireLog, manualAimFor, type Ent } from '../../game/combat';
 import { addFx, FIRE } from '../../game/vfx';
 import { kitLoaded } from '../assets';
@@ -17,7 +17,7 @@ import { buildShip, disposeShip, DECK, type ShipModel } from './hull';
 import { lightUniforms } from './lights';
 import type { Gun, Turret } from './turrets';
 import type { V3 } from './mesh';
-import { aimYaw, restYaw, holdYaw, bearingIn, type Traverse } from './arcs';
+import { aimYaw, restYaw, holdYaw, slewDelta, bearingIn, type Traverse } from './arcs';
 
 /** Flight-plane altitude of the ship origin: keeps the deck just under the bullet/muzzle layer. */
 const P_ALT = -10;
@@ -214,7 +214,7 @@ export class ShipLayer implements Layer {
           r.aims.set(tr.uid, want);
         }
         r.retarget.set(tr.uid, rt);
-        const want = r.aims.get(tr.uid) ?? tv.center, dd = angDiff(want, tr.cur), mx = tr.rate * dt;
+        const want = r.aims.get(tr.uid) ?? tv.center, dd = slewDelta(tv, tr.cur, want), mx = tr.rate * dt;
         // Ease in the last few degrees so heavy guns settle instead of snapping.
         tr.cur += clamp(dd * Math.min(1, dt * 6), -mx, mx);
         tr.cur = holdYaw(tv, tr.cur);

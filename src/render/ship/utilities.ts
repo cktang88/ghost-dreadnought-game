@@ -442,6 +442,6 @@ export function utilityModule(c: UCtx, rnd: Rng, s: UtilSpec) {
 
 /** The deck zone a utility module may use around its mount (reference scale). */
 export function utilZone(type: string, x: number, z: number): Box4 {
-  const hx = type === 'engine' ? 7.5 : type === 'spine' ? 8.5 : 9.5, hz = type === 'engine' ? 9 : 8.5;
+  const hx = type === 'engine' ? 7.5 : type === 'spine' ? 8.5 : 9.5, hz = type === 'engine' ? 7.5 : 8.5;
   return [x - hx, z - hz, x + hx, z + hz];
 }

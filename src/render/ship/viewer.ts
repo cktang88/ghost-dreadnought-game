@@ -1,5 +1,5 @@
 // Dev tool: the ship layer on its own, through the real engine (lighting, bloom, tone map) with a
-// zoomable camera. /tools/ship.html?build=starter|big|max&zoom=0.35&ghost=0|1&hp=1&phase=1..3&fire=1&t=4
+// zoomable camera. /tools/ship.html?build=starter|big|mid|max&zoom=0.35&ghost=0|1&hp=1&phase=1..3&fire=1&t=4
 import { Engine } from '../engine';
 import { ShipLayer } from './shipLayer';
 import { preloadKits } from '../assets';
@@ -10,13 +10,15 @@ import type { Ghost } from '../../game/ghosts';
 import * as THREE from 'three';
 
 const q = new URLSearchParams(location.search);
-const BUILDS: Record<string, [string, (string | null)[]][]> = {
+// Sections are [type, slots, facings?]; `mid` puts the bridge amidships.
+const BUILDS: Record<string, [string, (string | null)[], number[]?][]> = {
   starter: [['bridge', ['pulse']], ['gundeck', ['pulse', 'bomb']], ['engine', [null]]],
   big: [['bridge', ['pulse']], ['gundeck', ['flak', 'missile']], ['battery', ['spread', 'rail', 'tesla']], ['armor', ['plate']], ['spine', ['shield', 'drones']], ['engine', ['thruster']]],
+  mid: [['gundeck', ['pulse', 'flak'], [0, 0]], ['battery', ['spread', 'pulse', 'missile']], ['bridge', ['rail']], ['gundeck', ['flak', 'pulse'], [4, 4]], ['engine', ['thruster']]],
   max: [['bridge', ['rail']], ['gundeck', ['pulse', 'flak']], ['battery', ['spread', 'artillery', 'missile']], ['battery', ['tesla', 'pd', 'bomb']], ['armor', ['reactor']], ['spine', ['shield', 'magnet']], ['gundeck', ['pulse', 'artillery']], ['engine', ['repair']]],
 };
 const spec = BUILDS[q.get('build') || 'starter'] ?? JSON.parse(q.get('build')!);
-const build: Build = ghostToBuild(spec.map(([type, slots]) => ({ type, slots: slots.map((id) => (id ? [id, Number(q.get('tier') || 3)] : null)) })));
+const build: Build = ghostToBuild(spec.map(([type, slots, face]) => ({ type, face, slots: slots.map((id) => (id ? [id, Number(q.get('tier') || 3)] : null)) })));
 const ghost = q.get('ghost') === '1', zoom = Number(q.get('zoom') || 0.4), hp = Number(q.get('hp') || 1), fire = q.get('fire') !== '0';
 const canvas = document.createElement('canvas'); document.body.append(canvas);
 document.body.style.cssText = 'margin:0;background:#000;overflow:hidden';
