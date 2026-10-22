@@ -3,7 +3,8 @@
 import { clamp, rnd, pick, has, angDiff } from '../util/rng';
 import {
   WEAPONS, derive, wCd, wDmg, type Build, type Derived, type Part, type Mods, type Mount, type Arc, ghostToBuild,
-  weaponFamily, weaponGroups, HEAVY_FAMILIES, MAGNET, TRAVERSE, inTraverse, clampTraverse, layersHit, type WeaponGroup, type HeavyFamily, type TargetLayers, type Traverse,
+  weaponFamily, weaponGroups, HEAVY_FAMILIES, MAGNET, RANGE, inTraverse, clampTraverse, layersHit, shipToField, fieldToShip, facingAngle,
+  type WeaponGroup, type HeavyFamily, type TargetLayers, type Traverse, type Facing,
 } from '../data/parts';
 import { EN, type EnemyType, type Encounter } from '../data/enemies';
 import { hasFlag } from '../data/relics';
@@ -136,6 +137,28 @@ export function emit(e: Omit<GameEvent, 'id' | 't'>) {
   if (S.events.length > 160) S.events.splice(0, S.events.length - 160);
 }
 
+/* ---------------- bearings: every gun fires inside its mount's masked traverse ---------------- */
+// A mount's traverse (m.trav, data/parts.ts) is centred on its facing and masked by the hull (towers, funnels,
+// neighbouring sponsons). Player and ghost guns only fire along a bearing inside it; a ghost is mirrored (bow down).
+/** Field angle a mount faces. */
+export const faceAngle = (f: Facing, mirrored = false) => shipToField(facingAngle(f), mirrored);
+/** Where a gun points with nothing to shoot: its facing, held inside the masked traverse. */
+export const restAngle = (m: { facing: Facing; trav: Traverse }, mirrored = false) => clampTraverse(m.trav, faceAngle(m.facing, mirrored), mirrored);
+/** Is a field bearing inside one of the sectors the hull blocks for this mount? */
+export const blockedAt = (t: Traverse, a: number, mirrored = false) =>
+  t.blocked.some((s) => Math.abs(angDiff(fieldToShip(a, mirrored), s.c)) <= s.h + 1e-9);
+/** Points of a hull worth aiming at: centre, along the keel and out to the beams (a long ship can be half in an arc). */
+function hullPts(x: number, y: number, hw: number, hl: number): [number, number][] {
+  return [[x, y], [x, y - hl * 0.5], [x, y + hl * 0.5], [x, y - hl * 0.85], [x, y + hl * 0.85], [x - hw * 0.7, y], [x + hw * 0.7, y]];
+}
+const aimPts = (e: Ent): [number, number][] => (e.isBoss ? hullPts(e.x, e.y, e.halfW, (e.dv.len * e.s) / 2) : [[e.x, e.y]]);
+const playerPts = () => { const P = S.P!; return hullPts(P.x, P.y, P.dv.width / 2, P.dv.len / 2); };
+/** The first field bearing from (x, y) to one of `pts` that the traverse allows, or null (out of arc or blocked). */
+function bearingTo(t: Traverse, x: number, y: number, pts: [number, number][], mirrored = false): number | null {
+  for (const [px, py] of pts) { const a = Math.atan2(py - y, px - x); if (inTraverse(t, a, mirrored)) return a; }
+  return null;
+}
+
 /* ---------------- setup ---------------- */
 export function startCombat(c: CombatSetup) {
   resetFx();
@@ -156,7 +179,7 @@ export function startCombat(c: CombatSetup) {
   S.groups = weaponGroups(dv.mounts);
   resetAim();
   S.overdrive.charge = Math.max(0, Math.min(0.99, c.odCharge ?? 0));
-  S.P = { x: W / 2, y: H - 190, build: c.build, dv, hp: Math.min(c.hp, dv.maxHp), shield: dv.shieldMax, cds: {}, lastHit: 9, flash: 0, tx: null, ty: null, droneCd: [0, 0, 0], vx: 0, vy: 0, bank: 0 };
+  S.P = { x: W / 2, y: clamp(H - 190, dv.len / 2 + 56, H - dv.len / 2 - 8), build: c.build, dv, hp: Math.min(c.hp, dv.maxHp), shield: dv.shieldMax, cds: {}, lastHit: 9, flash: 0, tx: null, ty: null, droneCd: [0, 0, 0], vx: 0, vy: 0, bank: 0 };
   seedDecor();
   if (c.enc.kind === 'boss' && c.ghost) {
     spawnBoss(c.ghost);
@@ -223,12 +246,35 @@ function flankPoint(side: number, dist: number) {
   const P = S.P!;
   return { x: clamp(P.x + side * dist, 40, W - 40), y: clamp(P.y + rnd(-P.dv.len * 0.5, P.dv.len * 0.5), 90, H - 60) };
 }
+/** A point off the player's quarter, astern of the hull on one side: only aft-facing guns cover it. */
+function quarterPoint(side: number, dist: number) {
+  const P = S.P!, hw = P.dv.width / 2, hl = P.dv.len / 2;
+  return { x: clamp(P.x + side * (hw + dist * 0.6), 40, W - 40), y: clamp(P.y + hl + dist * 0.45, 90, H - 50) };
+}
+/**
+ * Rear entries: aircraft that come up from astern first hold just off the bottom edge for `warn` seconds (e.warnT; the
+ * HUD flashes an ASTERN chevron where they will break in), then run in. Shares of each director group that do so:
+ * interceptors overtaking, drone columns climbing the field, helicopters and gunships taking station on a quarter.
+ * They ramp in with the level (`aftRamp`: a third of the shares in the first fights, all of them from level 3.5).
+ */
+export const AFT = { warn: 1.3, y: H + 90, jet: 0.22, drone: 0.3, heli: 0.32, gunship: 0.38 } as const;
+export const aftRamp = () => clamp((S.level - 1) / 2.5, 0.35, 1);
+const aftEntry = (o: Record<string, any> = {}) => ({ aft: true, warnT: AFT.warn, ...o });
+/** An x beside the hull (outside its beam), so a run from astern passes the broadsides instead of ramming the stern. */
+function besideX(side: number, off: number) {
+  const P = S.P!, hw = P.dv.width / 2;
+  let x = P.x + side * (hw + off);
+  if (x < 40 || x > W - 40) x = P.x - side * (hw + off);
+  return clamp(x, 40, W - 40);
+}
 /** Spawns one group of type k the way the director does (also the `__gd.spawn` debug hook). */
-export function spawnGroup(k: EnemyType) {
-  const P = S.P!, x = rnd(60, W - 60), side = pick([-1, 1]);
+export function spawnGroup(k: EnemyType, aftOnly = false) {
+  const P = S.P!, x = rnd(60, W - 60), side = pick([-1, 1]), r = Math.random();
+  const ramp = aftRamp(), aft = (share: number) => aftOnly || r < share * ramp;
   switch (k) {
     case 'heli': {
       const n = S.level >= 2 && Math.random() < 0.5 ? 2 : 1;
+      if (aft(AFT.heli)) { for (let i = 0; i < n; i++) spawnEnemy('heli', besideX(side, 120 + i * 60), AFT.y + i * 30, aftEntry({ station: null, restation: 0, life: rnd(14, 18), quarter: side })); break; }
       for (let i = 0; i < n; i++) {
         const fromSide = Math.random() < 0.55, sx = side < 0 ? -30 : W + 30;
         spawnEnemy('heli', fromSide ? sx : clamp(x + i * 50, 40, W - 40), fromSide ? rnd(120, H - 200) : -20, { station: null, restation: 0, life: rnd(14, 18) });
@@ -236,7 +282,11 @@ export function spawnGroup(k: EnemyType) {
       break;
     }
     case 'jet': {
-      if (Math.random() < 0.45) {
+      if (aft(AFT.jet)) {
+        // overtaking run from astern, up one side of the hull: the aft quarter guns get the first shot
+        const n = S.level >= 3 ? 3 : 2, bx = besideX(side, rnd(90, 220));
+        for (let i = 0; i < n; i++) spawnEnemy('jet', clamp(bx + side * i * 34, 30, W - 30), AFT.y + i * 46, aftEntry({ vx: 0, vy: -330, overtake: true, hdg: -Math.PI / 2 }));
+      } else if (r < AFT.jet * ramp + 0.38) {
         // strafing run across the field, level with the hull: broadside bait
         const y = clamp(P.y + pick([-1, 1]) * (P.dv.len / 2 + rnd(40, 80)), 100, H - 60), n = S.level >= 3 ? 3 : 2;
         for (let i = 0; i < n; i++) spawnEnemy('jet', side < 0 ? -40 - i * 60 : W + 40 + i * 60, y + (i - 1) * 34, { vx: -side * 360, vy: 0, strafe: true, hdg: side < 0 ? 0 : Math.PI });
@@ -246,8 +296,14 @@ export function spawnGroup(k: EnemyType) {
       }
       break;
     }
-    case 'drone': { const bx = rnd(120, W - 120); for (let i = 0; i < 7; i++) spawnEnemy('drone', bx, -20 - i * 24, { baseX: bx, phase: i * 0.5 }); break; }
-    case 'gunship': spawnEnemy('gunship', side < 0 ? -40 : W + 40, rnd(150, H - 250), { side, life: 20 }); break;
+    case 'drone': {
+      if (aft(AFT.drone)) { const bx = besideX(side, rnd(170, 260)); for (let i = 0; i < 7; i++) spawnEnemy('drone', bx, AFT.y + i * 24, aftEntry({ baseX: bx, phase: i * 0.5, dir: -1 })); break; }
+      const bx = rnd(120, W - 120); for (let i = 0; i < 7; i++) spawnEnemy('drone', bx, -20 - i * 24, { baseX: bx, phase: i * 0.5 }); break;
+    }
+    case 'gunship':
+      if (aft(AFT.gunship)) spawnEnemy('gunship', besideX(side, 200), AFT.y, aftEntry({ side, life: 20, quarter: side }));
+      else spawnEnemy('gunship', side < 0 ? -40 : W + 40, rnd(150, H - 250), { side, life: 20 });
+      break;
     case 'bomber': { const y = clamp(P.y + rnd(-160, 60), 90, H - 120); spawnEnemy('bomber', side < 0 ? -50 : W + 50, y, { vx: -side * 70, hdg: side < 0 ? 0 : Math.PI }); break; }
     case 'tank': {
       // a platoon drives as a column down one street: true-scale armour reads as a convoy (one marker, a count)
@@ -270,8 +326,9 @@ export function spawnElite(type: EnemyType) {
 /* ---------------- boss ---------------- */
 // A ghost flies the wreck it was recorded as, and every weapon keeps the arc its mount gives it, mirrored (its bow
 // points down the screen, at you):
-//  - every gun trains inside its mount's traverse (mountTraverse in data/parts.ts, mirrored): the bridge gun a cone
-//    below it, top-deck turrets all round (the player is an aircraft to them), broadsides their flank sector;
+//  - every gun trains inside its mount's recorded facing and masked traverse (m.trav, mirrored): the bridge gun a cone
+//    below it, top-deck turrets 240 degrees about their facing (the player is an aircraft to them), sponsons their 120;
+//    a gun whose arc holds no part of the player's hull holds fire, so its blind arcs are safe water;
 //  - Broadside Battery guns fire telegraphed ripple volleys off its flanks, stern to bow, like ours;
 //  - bombs and mortars work ventrally (mines and telegraphed strikes), coils and point defense all round.
 // So it has zones, as the player does: under its bow you eat the bow guns, beside it the broadsides.
@@ -287,8 +344,8 @@ export const BOSS_BROADSIDE = {
   /** Phase 3 weave offset either side of the aimed line. */ weave: 0.15,
 } as const;
 const BOSS_CD: Record<string, number> = { pulse: 1.5, spread: 2.5, flak: 2.9, missile: 3.6, bomb: 3.1, artillery: 3.4, rail: 4.6, tesla: 2.6, pd: 0.45 };
-/** A ghost gun: mount offset in design units (scaled by Boss.s), arc and broadside side as on the player's ship. */
-export interface BossGun { part: Part; ox: number; oy: number; cd: number; arc: Arc; side: -1 | 0 | 1; /** Half width of its section: broadside muzzles sit on the hull side. */ edge: number; /** Mount traverse (ship space; the ghost is mirrored). */ trav: Traverse }
+/** A ghost gun: mount offset (its own hull's field units, times Boss.s), arc, facing and side as on the player's ship. */
+export interface BossGun { part: Part; ox: number; oy: number; cd: number; arc: Arc; side: -1 | 0 | 1; facing: Facing; /** Masked mount traverse (ship space; the ghost is mirrored). */ trav: Traverse }
 /** Broadside state for one flank: cooldown, wind-up (-1 idle) and the ripple's scheduled rounds. */
 export interface BossVolley { cd: number; wind: number; queue: { at: number; fire: () => void }[] }
 /** A wind-up glint for the FX layer: field point, 0..1 progress, lane angle, and the sweep half-angle (0: one line). */
@@ -300,7 +357,9 @@ export const bossRounds = (p: Part, phase: number) =>
 
 function spawnBoss(g: Ghost) {
   const sec = S.sector, build = ghostToBuild(g.sections), dv = derive(build);
-  const s = Math.min(1.6, 520 / dv.len, 700 / dv.width);
+  // Hulls are long now (an eight-section ship is ~550): a ghost is drawn at most 440 long, so even a long player hull
+  // keeps sea room beside and under it on a 900-tall field.
+  const s = Math.min(1.6, 440 / dv.len, 700 / dv.width);
   // Sector dominates: player power grows several-fold across a run, so the ghosts must too. The ghost's own hull adds on top.
   // A ghost that comes about to bring its broadsides to bear also takes ours. Early hulls are broadside-heavy, so the
   // early ghosts get the most extra hull (x1.75 in sector 1, x1.35 in 2, none from 3): every duel lasts about half a minute.
@@ -309,12 +368,12 @@ function spawnBoss(g: Ghost) {
   const maxHp = (1800 * Math.pow(sec, 1.55) + dv.maxHp * 2) * duel * (SHIP_SCALE / 2.6) * S.P!.dv.mods.bossHpMul * S.heat.bossHp;
   const u = dv.u, shield = u.shield * 40 * (0.8 + 0.35 * sec);
   S.boss = {
-    ghost: g, build, dv, s, x: W / 2, y: -(dv.len * s) / 2 - 10, homeY: (dv.len * s) / 2 + 70, halfW: (dv.width * s) / 2, r: (dv.width * s) / 2,
+    ghost: g, build, dv, s, x: W / 2, y: -(dv.len * s) / 2 - 10, homeY: (dv.len * s) / 2 + 60, halfW: (dv.width * s) / 2, r: (dv.width * s) / 2,
     layer: 'both', isBoss: true, alive: true, dead: false, hp: maxHp, maxHp, shieldMax: shield, shield, shieldHitT: 9,
     regen: u.repair * 0.0025 * maxHp, tractor: u.magnet * 14, droneEvery: u.drones ? Math.max(5, 10 - u.drones) : 0, droneT: 6,
     speedMul: 1 + 0.12 * u.thruster, fireMul: (1 + 0.1 * u.reactor) * S.heat.bossFire, cdMul: clamp(1.15 - 0.06 * sec, 0.6, 1.1),
     t: 0, phase: 1, flash: 0, entered: false, vx: 0,
-    weps: dv.mounts.filter((m) => m.part && has(WEAPONS, m.part.id)).map((m, i) => ({ part: m.part!, ox: m.ox, oy: m.oy, cd: 1.2 + i * 0.45, arc: m.arc, side: m.side, edge: dv.rects[m.si].w / 2, trav: m.trav })),
+    weps: dv.mounts.filter((m) => m.part && has(WEAPONS, m.part.id)).map((m, i) => ({ part: m.part!, ox: m.ox, oy: m.oy, cd: 1.2 + i * 0.45, arc: m.arc, side: m.side, facing: m.facing, trav: m.trav })),
     // first volleys come a beat after the bow guns open up, port and starboard out of step
     volley: [{ cd: 2.2, wind: -1, queue: [] }, { cd: 3.4, wind: -1, queue: [] }], glints: [],
   };
@@ -329,19 +388,30 @@ function eShot(x: number, y: number, a: number, spd: number, o: Record<string, a
   S.eb.push({ x, y, vx: Math.cos(a) * spd, vy: Math.sin(a) * spd, r: 4.5, dmg: edmg(), col: '#ff5a4e', kind: 'bullet', life: 8, t: 0, dead: false, src: shooter, ...o });
 }
 function ring(x: number, y: number, n: number, spd: number, o: Record<string, any> = {}) { const off = rnd(0, Math.PI * 2); for (let i = 0; i < n; i++) eShot(x, y, off + (i * Math.PI * 2) / n, spd, o); }
-/** Aim at the player, held inside the ghost's bow cone (its bow points down the screen). */
-const gunAim = (w: BossGun, x: number, y: number) => clampTraverse(w.trav, aimAng(x, y), true);
-function bossFire(w: BossGun) {
+/** The bearing a ghost gun has on the player's hull (mirrored traverse), or null when the player is in its blind arc. */
+const bossBearing = (w: BossGun, x: number, y: number) => bearingTo(w.trav, x, y, playerPts(), true);
+/** Does this aimed ghost gun (bridge, top deck, sponson) bear on the player's hull right now? (Omni and ventral guns always do.) */
+export function bossGunBears(w: BossGun) {
+  if (w.arc !== 'bow' && w.arc !== 'dorsal' && w.arc !== 'broadside') return true;
+  const p = bossMount(w); return bossBearing(w, p.x, p.y) !== null;
+}
+/** One shot from a ghost's bridge, top-deck or omni/ventral gun. Returns false (holding fire) when an aimed gun has no
+ *  bearing on the player: its facing and the ghost's own hull leave the player in a blind arc. */
+function bossFire(w: BossGun): boolean {
   const P = S.P!, { x, y } = bossMount(w), t = w.part.tier, dmg = edmg() * 0.65 * (1 + 0.15 * (t - 1)) * bossHitEase(), spd = bspd(), sec = S.sector;
-  if (w.part.id !== 'pd' && w.part.id !== 'artillery') muzzle(x, y + 8, '#ff7a5c', w.part.id === 'rail' ? 22 : 14);
+  const aimed = w.arc === 'bow' || w.arc === 'dorsal' || w.arc === 'broadside';
+  const a = aimed ? bossBearing(w, x, y) : aimAng(x, y);
+  if (a === null) return false;
+  const inArc = (aa: number) => (aimed ? clampTraverse(w.trav, aa, true) : aa);
+  if (w.part.id !== 'pd' && w.part.id !== 'artillery') muzzle(x + Math.cos(a) * 8, y + Math.sin(a) * 8, '#ff7a5c', w.part.id === 'rail' ? 22 : 14);
   switch (w.part.id) {
-    case 'pulse': { const a = gunAim(w, x, y); for (let k = 0; k < 3 + (t >= 3 ? 1 : 0); k++) eShot(x, y, a + rnd(-0.04, 0.04), spd * (1 - 0.12 * k), { dmg }); break; }
-    case 'spread': { const n = 7 + Math.min(4, t), c0 = w.arc === 'dorsal' ? gunAim(w, x, y) : Math.PI / 2; for (let i = 0; i < n; i++) eShot(x, y, c0 + (i - (n - 1) / 2) * 0.17, spd * 0.85, { dmg, col: '#ff7a6b' }); break; }
-    case 'flak': { const a = gunAim(w, x, y), d = Math.hypot(P.x - x, P.y - y); eShot(x, y, a, 150, { kind: 'orb', r: 8, life: clamp(d / 150, 0.6, 2.4), col: '#ffd27a', dmg }); break; }
-    case 'missile': for (const s of [-1, 1]) eShot(x + s * 6, y, Math.PI / 2 + s * 0.7, 140, { kind: 'missile', turn: 1.6 + 0.2 * t, spd: 150 + 10 * t, hp: 5 * sec, life: 5, r: 5, col: '#ff9f5a', dmg: dmg * 1.5 }); break;
+    case 'pulse': { for (let k = 0; k < 3 + (t >= 3 ? 1 : 0); k++) eShot(x, y, a + rnd(-0.04, 0.04), spd * (1 - 0.12 * k), { dmg }); break; }
+    case 'spread': { const n = 7 + Math.min(4, t); for (let i = 0; i < n; i++) eShot(x, y, inArc(a + (i - (n - 1) / 2) * 0.17), spd * 0.85, { dmg, col: '#ff7a6b' }); break; }
+    case 'flak': { const d = Math.hypot(P.x - x, P.y - y); eShot(x, y, a, 150, { kind: 'orb', r: 8, life: clamp(d / 150, 0.6, 2.4), col: '#ffd27a', dmg }); break; }
+    case 'missile': for (const s of [-1, 1]) eShot(x + s * 6, y, inArc(a + s * 0.7), 140, { kind: 'missile', turn: 1.6 + 0.2 * t, spd: 150 + 10 * t, hp: 5 * sec, life: 5, r: 5, col: '#ff9f5a', dmg: dmg * 1.5 }); break;
     case 'bomb': for (let i = -1; i <= 1; i++) eShot(x + i * 18, y, Math.PI / 2, 90 + rnd(0, 40), { kind: 'mine', r: 7, life: rnd(1.3, 2.1), col: '#f2a541', dmg }); break;
     case 'artillery': { const n = t >= 3 ? 4 : 2; for (let k = 0; k < n; k++) strike(P.x + (k ? rnd(-110, 110) : 0), P.y + (k ? rnd(-90, 90) : 0), dmg * 2.2, 46); break; }
-    case 'rail': S.eb.push({ kind: 'beam', x, y, warn: 1.0, dur: 0.3, w: 18 + 3 * t, dmg: dmg * 4, t: 0, life: 9, vx: 0, vy: 0, r: 0, col: '#c9a6ff', dead: false, src: 'boss' }); break;
+    case 'rail': S.eb.push({ kind: 'beam', x, y, x2: x + Math.cos(a) * 1900, y2: y + Math.sin(a) * 1900, warn: 1.0, dur: 0.3, w: 18 + 3 * t, dmg: dmg * 4, t: 0, life: 9, vx: 0, vy: 0, r: 0, col: '#c9a6ff', dead: false, src: 'boss', gun: w }); break;
     case 'tesla': ring(x, y, 12 + t, spd * 0.6, { r: 3.5, col: '#9be7ff', dmg: dmg * 0.8 }); sfx('zap', { x, y }); break;
     case 'pd': {
       let best: Ent | null = null, bd = 160 * 160;
@@ -350,33 +420,23 @@ function bossFire(w: BossGun) {
       break;
     }
   }
+  return true;
 }
 /** A telegraphed ground-to-air strike: a hostile ring grows for `delay` seconds, then detonates. */
 const strike = (x: number, y: number, dmg: number, rad = 42, delay = 1.2) => S.eb.push({ kind: 'strike', x: clamp(x, 20, W - 20), y: clamp(y, 20, H - 20), delay, rad, dmg, t: 0, life: 9, vx: 0, vy: 0, r: 0, dead: false });
 
 /* ---- ghost broadsides ---- */
-/** Where a broadside gun's muzzle is: on the hull side of its section, at its row (the ghost is mirrored, stern up). */
-const bossGunPos = (b: Boss, w: BossGun, side: number) => ({ x: b.x + side * (w.edge * b.s + 4), y: b.y - w.oy * b.s });
-/** Depression below the beam (radians, + toward the bottom of the screen) from (x, y) to the player, for a flank. */
-function depressionTo(x: number, y: number, side: number) {
-  const P = S.P!, base = side > 0 ? 0 : Math.PI;
-  return angDiff(Math.atan2(P.y - y, P.x - x), base) * side;
+/** Where a ghost gun's muzzle is: its real mount along the keel, mirrored (stern up). */
+const bossGunPos = (b: Boss, w: BossGun) => ({ x: b.x + w.ox * b.s, y: b.y - w.oy * b.s });
+/** A flank's sponsons that can train at all (the hull may mask one completely). */
+const bossGuns = (b: Boss, side: number) => b.weps.filter((w) => w.arc === 'broadside' && w.side === side && w.trav.sectors.length);
+/** The sponsons of a flank that join this volley: those with a bearing on the player's hull (phase 3: all of them). */
+function bossFiring(b: Boss, side: number) {
+  const g = bossGuns(b, side);
+  return b.phase >= 3 ? g : g.filter(bossGunBears);
 }
-const sideAngle = (side: number, dep: number) => (side > 0 ? 0 : Math.PI) + side * dep;
-/** Broadside guns train inside their flank sector (TRAVERSE.broadside either side of the beam); they cannot fire across their own hull. */
-const lockDep = (d: number) => clamp(d, -TRAVERSE.broadside, TRAVERSE.broadside);
-/** Does a flank have the player in its arc? Phase 3 fires both flanks regardless. */
-function bossFlankEngaged(b: Boss, side: number) {
-  if (b.phase >= 3) return true;
-  const P = S.P!, dx = (P.x - b.x) * side;
-  if (dx < b.halfW * 0.5) return false;
-  const d = depressionTo(b.x + side * b.halfW, b.y, side);
-  return Math.abs(d) < TRAVERSE.broadside + (b.phase === 2 ? 0.25 : 0.05);
-}
-function bossGuns(b: Boss, side: number) {
-  const pSide = S.P!.x >= b.x ? 1 : -1;
-  return b.weps.filter((w) => w.arc === 'broadside' && (w.side === side || (w.side === 0 && side === pSide)));
-}
+/** A sponson's locked line: its bearing on the player, or the nearest edge of its arc (phase 3 fires blind). */
+function bossLock(b: Boss, w: BossGun) { const p = bossGunPos(b, w); return bossBearing(w, p.x, p.y) ?? clampTraverse(w.trav, aimAng(p.x, p.y), true); }
 function updateBossBroadsides(b: Boss, dt: number, fm: number) {
   const BS = BOSS_BROADSIDE;
   b.glints.length = 0;
@@ -386,23 +446,23 @@ function updateBossBroadsides(b: Boss, dt: number, fm: number) {
       for (const q of v.queue) if (q.at <= S.time) { q.at = -1; q.fire(); }
       v.queue = v.queue.filter((q) => q.at !== -1);
     }
-    const guns = bossGuns(b, side);
-    if (!guns.length) { v.wind = -1; continue; }
+    if (!bossGuns(b, side).length) { v.wind = -1; continue; }
     if (v.wind >= 0) {
-      const tele = BS.tele[b.phase - 1];
+      const tele = BS.tele[b.phase - 1], guns = bossFiring(b, side);
       v.wind += dt;
       const k = clamp(v.wind / tele, 0, 1);
       for (const w of guns) {
-        const p = bossGunPos(b, w, side), d = lockDep(depressionTo(p.x, p.y, side));
-        b.glints.push({ x: p.x, y: p.y, tele: k, ang: sideAngle(side, d), spread: b.phase === 2 ? BS.rake / 2 : b.phase === 3 ? BS.weave : 0, len: 220 + 260 * k });
+        const p = bossGunPos(b, w);
+        b.glints.push({ x: p.x, y: p.y, tele: k, ang: bossLock(b, w), spread: b.phase === 2 ? BS.rake / 2 : b.phase === 3 ? BS.weave : 0, len: 220 + 260 * k });
       }
-      if (v.wind >= tele) { v.wind = -1; v.cd = BS.period; releaseBossVolley(b, side, guns); }
+      // slipping into its blind arc during the wind-up spoils the volley
+      if (v.wind >= tele) { v.wind = -1; v.cd = guns.length ? BS.period : 0.6; if (guns.length) releaseBossVolley(b, side, guns); }
       continue;
     }
     if (v.queue.length) continue; // the ripple is still running down the hull
     v.cd -= dt * fm;
     if (v.cd > 0) continue;
-    if (!bossFlankEngaged(b, side)) { v.cd = 0.2; continue; }
+    if (!bossFiring(b, side).length) { v.cd = 0.2; continue; }
     v.wind = 0;
   }
 }
@@ -411,7 +471,7 @@ function releaseBossVolley(b: Boss, side: number, guns: BossGun[]) {
   const BS = BOSS_BROADSIDE, ph = b.phase;
   const order = [...guns].sort((a, c) => c.oy - a.oy);
   const rounds = order.map((w) => bossRounds(w.part, ph)), maxR = Math.max(...rounds);
-  const locks = order.map((w) => { const p = bossGunPos(b, w, side); return lockDep(depressionTo(p.x, p.y, side)); });
+  const locks = order.map((w) => bossLock(b, w));
   const hole = rnd(0.2, 0.8);
   let k = 0;
   for (let r = 0; r < maxR; r++) order.forEach((w, gi) => {
@@ -427,7 +487,7 @@ function releaseBossVolley(b: Boss, side: number, guns: BossGun[]) {
 function bossRound(b: Boss, w: BossGun, side: number, r: number, R: number, lock: number, hole: number) {
   if (!b.alive || S.mode !== 'play') return;
   const BS = BOSS_BROADSIDE, P = S.P!, p = w.part, t = p.tier, ph = b.phase;
-  const { x, y } = bossGunPos(b, w, side);
+  const { x, y } = bossGunPos(b, w);
   const dmg = edmg() * 0.7 * (1 + 0.15 * (t - 1)) * bossHitEase(), spd = bspd() * 0.9;
   let d = lock;
   if (ph === 2 && R > 1) {
@@ -436,7 +496,8 @@ function bossRound(b: Boss, w: BossGun, side: number, r: number, R: number, lock
     if (Math.abs(u - hole) < BS.hole / BS.rake / 2) return;
     d = lock + (u - 0.5) * BS.rake;
   } else if (ph === 3) d = lock + (r % 2 ? BS.weave : -BS.weave);
-  const a = sideAngle(side, d);
+  // every round stays inside the sponson's masked arc: a rake or weave never sweeps through its own hull
+  const a = clampTraverse(w.trav, d, true);
   shooter = 'boss:broadside';
   switch (p.id) {
     case 'spread': for (const o of [-0.08, 0, 0.08]) eShot(x, y, a + o, spd * 0.85, { dmg, col: '#ff7a6b' }); break;
@@ -446,9 +507,10 @@ function bossRound(b: Boss, w: BossGun, side: number, r: number, R: number, lock
     default: for (const o of [-7, 7]) eShot(x, y + o, a, spd, { dmg }); // twin barrels: pulse and anything else
   }
   // phase 3 adds a slow second layer under the fast one
-  if (ph === 3 && r % 2 === 0 && p.id !== 'rail' && p.id !== 'missile') eShot(x, y, sideAngle(side, lock + 0.42), spd * 0.55, { dmg, r: 5.5, col: '#ff7a6b' });
-  muzzle(x + side * 8, y, '#ff7a5c', 15);
-  addFx({ type: 'smoke', x: x + side * 14, y, vx: side * rnd(60, 120), vy: rnd(-10, 10), life: 0.9, max: 0.9, size: 7, grow: 2.2, a: 0.45, drag: 2 });
+  if (ph === 3 && r % 2 === 0 && p.id !== 'rail' && p.id !== 'missile') eShot(x, y, clampTraverse(w.trav, lock + side * 0.42, true), spd * 0.55, { dmg, r: 5.5, col: '#ff7a6b' });
+  const cs = Math.cos(a), sn = Math.sin(a);
+  muzzle(x + cs * 8, y + sn * 8, '#ff7a5c', 15);
+  addFx({ type: 'smoke', x: x + cs * 14, y: y + sn * 14, vx: cs * rnd(60, 120), vy: sn * rnd(60, 120), life: 0.9, max: 0.9, size: 7, grow: 2.2, a: 0.45, drag: 2 });
   fireLog.set(p.uid, S.t);
 }
 /** A heavy ship: phase 1 sweeps the field; later it comes about to keep the player on its beam. */
@@ -470,7 +532,7 @@ function updateBoss(dt: number) {
   b.t += dt; b.flash -= dt;
   if (!b.entered) { b.y += 70 * dt; if (b.y >= b.homeY) { b.y = b.homeY; b.entered = true; b.t = 0; } }
   else moveBoss(b, dt);
-  for (const r of b.dv.rects) if (r.type === 'engine') for (const sx of [-0.22, 0.22]) if (Math.random() < 0.6) addFx({ type: 'fire', x: b.x + r.w * sx * b.s, y: b.y - (r.y + r.h) * b.s - 10, vx: rnd(-10, 10), vy: rnd(-160, -110), life: 0.25, max: 0.25, size: rnd(5, 8), grow: 0.4 });
+  for (const r of b.dv.rects) if (r.type === 'engine') for (const sx of [-0.22, 0.22]) if (Math.random() < 0.6) addFx({ type: 'fire', x: b.x + (r.x + r.w * (0.5 + sx)) * b.s, y: b.y - (r.y + r.h) * b.s - 10, vx: rnd(-10, 10), vy: rnd(-160, -110), life: 0.25, max: 0.25, size: rnd(5, 8), grow: 0.4 });
   if (b.phase >= 2 && Math.random() < dt * (b.phase === 3 ? 34 : 22)) {
     const r = pick(b.dv.rects), x = b.x + rnd(r.x, r.x + r.w) * b.s, y = b.y - (r.y + rnd(0, r.h)) * b.s;
     addFx({ type: 'fire', x, y, vx: rnd(-10, 10), vy: rnd(-30, 10), life: 0.45, max: 0.45, size: rnd(6, 10), grow: 0.8 });
@@ -496,7 +558,8 @@ function updateBoss(dt: number) {
   for (const w of b.weps) {
     if (w.arc === 'broadside') continue; // fired by the flank volleys
     w.cd -= dt * fmBow; if (w.cd > 0) continue;
-    w.cd = BOSS_CD[w.part.id] * b.cdMul * rnd(0.85, 1.15); bossFire(w); fireLog.set(w.part.uid, S.t);
+    if (!bossFire(w)) { w.cd = 0.25; continue; } // the player is in its blind arc: hold, loaded
+    w.cd = BOSS_CD[w.part.id] * b.cdMul * rnd(0.85, 1.15); fireLog.set(w.part.uid, S.t);
   }
   updateBossBroadsides(b, dt, fm);
 }
@@ -543,7 +606,7 @@ function updatePlayer(dt: number) {
   if (dv.regen) P.hp = Math.min(dv.maxHp, P.hp + dv.regen * dt);
   if (dv.shieldMax && P.lastHit > 2) P.shield = Math.min(dv.shieldMax, P.shield + dv.shieldRegen * dt);
   P.flash = Math.max(0, P.flash - dt * 5);
-  for (const r of dv.rects) if (r.type === 'engine') for (const sx of [-0.22, 0.22]) if (Math.random() < 0.7) addFx({ type: 'fire', x: P.x + r.w * sx + rnd(-1, 1), y: P.y + r.y + r.h + 9, vx: rnd(-8, 8), vy: rnd(150, 220), life: 0.2, max: 0.2, size: rnd(3, 4.5), grow: 0.4 });
+  for (const r of dv.rects) if (r.type === 'engine') for (const sx of [-0.22, 0.22]) if (Math.random() < 0.7) addFx({ type: 'fire', x: P.x + r.x + r.w * (0.5 + sx) + rnd(-1, 1), y: P.y + r.y + r.h + 9, vx: rnd(-8, 8), vy: rnd(150, 220), life: 0.2, max: 0.2, size: rnd(3, 4.5), grow: 0.4 });
   if (P.hp < dv.maxHp * 0.45 && Math.random() < dt * 16) {
     const r = pick(dv.rects), x = P.x + rnd(r.x, r.x + r.w), y = P.y + r.y + rnd(0, r.h);
     addFx({ type: 'smoke', x, y, vx: rnd(-10, 10), vy: rnd(70, 110), life: 1, max: 1, size: 4, grow: 2.4, a: 0.6 });
@@ -591,7 +654,8 @@ function playerDie() {
   sfx('big', { x: P.x, layer: 'ship' }); V.shake = 16; V.flashA = 0.4; boomFx(P.x, P.y, 40, '#ffb347');
   requestStop(S.stop, 0.2, true); requestSlow(S.slowmo, SLOWMO);
 }
-export function dronePos(i: number, n: number) { const P = S.P!, a = S.t * 1.8 + (i * Math.PI * 2) / n, R = Math.max(P.dv.width, P.dv.len) / 2 + 16; return { x: P.x + Math.cos(a) * R, y: P.y + Math.sin(a) * R * 0.6 }; }
+/** Escort drones orbit the hull on an ellipse that hugs a long, narrow ship. */
+export function dronePos(i: number, n: number) { const P = S.P!, a = S.t * 1.8 + (i * Math.PI * 2) / n; return { x: P.x + Math.cos(a) * (P.dv.width / 2 + 70), y: P.y + Math.sin(a) * (P.dv.len / 2 + 24) }; }
 function updateDrones(dt: number) {
   const P = S.P!, n = P.dv.drones; if (!n) return;
   for (let i = 0; i < n; i++) {
@@ -730,9 +794,10 @@ export function firingGroups(): WeaponGroup[] {
   if (aim.salvo) return S.groups;
   return aim.fire && S.groups[aim.group] ? [S.groups[aim.group]] : [];
 }
-/** Why a heavy mount cannot bear: '' (it can), 'arc' (outside its traverse), 'range' (ground ordnance out of reach),
- *  'air' (a top-deck mount and the reticle is on a ground target), 'ground' (ventral ordnance on an aircraft lock). */
-export type NoBear = '' | 'arc' | 'range' | 'air' | 'ground';
+/** Why a heavy mount cannot bear: '' (it can), 'arc' (outside its facing's arc), 'blocked' (inside it, but the ship's own
+ *  hull masks that bearing), 'range' (ground ordnance out of reach), 'air' (a top-deck mount and the reticle is on a
+ *  ground target), 'ground' (ventral ordnance on an aircraft lock). */
+export type NoBear = '' | 'arc' | 'blocked' | 'range' | 'air' | 'ground';
 /**
  * Can heavy mount m bear on field point (ax, ay), with `hover` the target under the reticle? Line weapons (rails)
  * must have the point inside their traverse; ground ordnance has a reach; missiles are guided and launch from any
@@ -744,7 +809,8 @@ export function heavyWhy(m: Mount, ax: number, ay: number, hover: Ent | null): N
   if (def.aim === 'ground') return Math.hypot(ax - x, ay - y) <= def.reach ? '' : 'range';
   if (hover && !layersHit(t.layers, hover.layer)) return t.layers === 'air' ? 'air' : 'ground';
   if (def.aim === 'lock') return '';
-  return inTraverse(t, Math.atan2(ay - y, ax - x)) ? '' : 'arc';
+  const a = Math.atan2(ay - y, ax - x);
+  return inTraverse(t, a) ? '' : blockedAt(t, a) ? 'blocked' : 'arc';
 }
 export const heavyBears = (m: Mount, ax: number, ay: number, hover: Ent | null = null) => heavyWhy(m, ax, ay, hover) === '';
 /** Where a heavy turret should point (renderer hook): the reticle or the missile lock, or null when it aims itself. */
@@ -786,22 +852,22 @@ function fireHeavy(m: Mount, x: number, y: number) {
   switch (fam) {
     case 'rail': {
       const a = clampTraverse(m.trav, Math.atan2(ay - y, ax - x));
-      const mx = m.arc === 'broadside' ? x + Math.sign(Math.cos(a)) * P.dv.width * 0.12 : x;
-      railLine(mx, y, mx + Math.cos(a) * 1900, y + Math.sin(a) * 1900, d, c, m.trav.layers);
-      muzzle(mx + Math.cos(a) * 10, y + Math.sin(a) * 10, c, 24);
+      railLine(x, y, x + Math.cos(a) * 1900, y + Math.sin(a) * 1900, d, c, m.trav.layers);
+      muzzle(x + Math.cos(a) * 10, y + Math.sin(a) * 10, c, 24);
       kick(-Math.cos(a) * 9, -Math.sin(a) * 9); addTrauma(0.2); V.flashA = Math.max(V.flashA, 0.05);
       break;
     }
     case 'missile': {
-      const s0 = m.arc === 'broadside' ? (m.side || (ax < x ? -1 : 1)) : 0;
+      // launched from the pod along its bearing (inside its traverse), then guided onto the lock or the point
+      const a0 = m.trav.sectors.length ? clampTraverse(m.trav, Math.atan2(ay - y, ax - x)) : -Math.PI / 2;
       for (const s of [-1, 1]) {
-        const vx = s0 ? s0 * 300 : s * 150, vy = s0 ? s * 80 : -170;
+        const la = m.trav.sectors.length ? clampTraverse(m.trav, a0 + s * 0.45) : a0 + s * 0.45, vx = Math.cos(la) * 280, vy = Math.sin(la) * 280;
         const lay = m.trav.layers === 'air' ? 'air' : 'both', lk = aim.lock && !aim.lock.dead && layerOk(lay, aim.lock.layer) ? aim.lock : null;
         const b = bolt(x + s * 5, y, vx, vy, d, lay, c, 3);
         Object.assign(b, { kind: 'missile', turn: 6, speed: 520, life: 3.2, manual: true, tg: lk, dest: { x: ax, y: ay } });
         S.pb.push(b);
       }
-      muzzle(x, y - 6, c, 14); sfx('missile', { x, layer: 'ship' }); addTrauma(0.07);
+      muzzle(x + Math.cos(a0) * 6, y + Math.sin(a0) * 6, c, 14); sfx('missile', { x, layer: 'ship' }); addTrauma(0.07);
       break;
     }
     case 'mortar': {
@@ -833,44 +899,36 @@ function nearest(x: number, y: number, f: (e: Ent) => boolean, maxD: number) {
   for (const e of allTargets()) { if (e.dead || !f(e)) continue; const d = Math.hypot(e.x - x, e.y - y) - (e.isBoss ? e.r * 0.6 : 0); if (d < bd) { bd = d; best = e; } }
   return best;
 }
-/** Range and cone numbers for each arc, shared with docs. Cones are the mount traverses (TRAVERSE in data/parts.ts). */
-export const ARC_RANGE = { bow: 1000, dorsal: 720, broadside: 760, broadsideBand: 90, ventralBomb: 0, mortar: 520, tesla: 240 } as const;
-/** The best target for a mount's arc, or null when nothing is in its arc (the battery then holds fire). Bow and
- *  broadside mounts engage air and ground inside their sectors; top-deck (dorsal) turrets turn all round but only
- *  engage aircraft and ships. */
-function arcTarget(m: Mount, x: number, y: number): Ent | null {
-  const P = S.P!, t = m.trav;
-  if (m.arc === 'bow' || m.arc === 'dorsal') {
-    let best: Ent | null = null, bd = Infinity;
-    const range = m.arc === 'bow' ? ARC_RANGE.bow : ARC_RANGE.dorsal;
-    for (const e of allTargets()) {
-      if (e.dead || !layersHit(t.layers, e.layer) || e.y < -40) continue;
-      const reach = e.isBoss ? e.halfW : e.r, dx = e.x - x, dy = e.y - y, dist = Math.hypot(dx, dy) - reach;
-      if (dist > range) continue;
-      // inside the sector, or a ship whose hull reaches into it
-      const nx = e.isBoss ? clamp(x, e.x - reach, e.x + reach) : e.x;
-      if (!inTraverse(t, Math.atan2(dy, dx)) && !inTraverse(t, Math.atan2(dy, nx - x))) continue;
-      const d = (m.arc === 'bow' ? (y - e.y) + Math.abs(dx) * 1.5 : dist) + (EN[e.type as EnemyType]?.salvage ? 300 : 0);
-      if (d < bd) { bd = d; best = e; }
-    }
-    return best;
+/** Reach by arc and part (to the target's edge): the data in parts.ts (RANGE, Mount.range), which the builder shows.
+ *  Cones are the masked mount traverses (m.trav). */
+export const ARC_RANGE = RANGE;
+/** How much a target off the mount's facing costs in target choice (field units per radian): guns prefer what they face. */
+const OFF_FACING = { bow: 260, dorsal: 90, broadside: 170 } as const;
+/** A target and the bearing a mount fires at it along. */
+export interface ArcHit { e: Ent; a: number }
+/** Is an enemy on the field and live enough to shoot at (rear entries still holding off the edge are not)? */
+const onFieldTarget = (e: Ent) => !e.dead && !(e.warnT > 0) && e.y > -40 && e.y < H + 20 && e.x > -40 && e.x < W + 40;
+/**
+ * The best target for a bow, top-deck or broadside mount, or null when nothing is in its arc (the gun then holds fire).
+ * Every bearing must lie inside the mount's masked traverse: an aft-angled sponson only fires aft, a turret facing
+ * astern only engages what is astern, and a bearing the hull blocks is never fired through. A ghost's hull counts if
+ * any part of it is in the arc. Bow and broadside mounts engage air and ground, top-deck turrets aircraft and ships.
+ */
+export function arcTarget(m: Mount, x: number, y: number): ArcHit | null {
+  const t = m.trav, arc = m.arc;
+  if (arc !== 'bow' && arc !== 'dorsal' && arc !== 'broadside') return null;
+  const range = m.range || RANGE[arc], face = faceAngle(m.facing);
+  let best: ArcHit | null = null, bd = Infinity;
+  for (const e of allTargets()) {
+    if (!onFieldTarget(e) || !layersHit(t.layers, e.layer)) continue;
+    const dist = e.isBoss ? Math.hypot(Math.max(0, Math.abs(e.x - x) - e.halfW), Math.max(0, Math.abs(e.y - y) - (e.dv.len * e.s) / 2)) : Math.hypot(e.x - x, e.y - y) - e.r;
+    if (dist > range) continue;
+    const a = bearingTo(t, x, y, aimPts(e));
+    if (a === null) continue;
+    const d = dist + Math.abs(angDiff(a, face)) * OFF_FACING[arc] + (EN[e.type as EnemyType]?.salvage ? 300 : 0);
+    if (d < bd) { bd = d; best = { e, a }; }
   }
-  if (m.arc === 'broadside') {
-    const band = P.dv.len / 2 + ARC_RANGE.broadsideBand;
-    let best: Ent | null = null, bd = Infinity;
-    for (const side of m.side ? [m.side] : [-1, 1]) {
-      for (const e of allTargets()) {
-        if (e.dead || !layersHit(t.layers, e.layer)) continue;
-        const dx = (e.x - x) * side, reach = e.isBoss ? e.halfW : e.r;
-        if (dx < -reach + P.dv.width * 0.3 || dx > ARC_RANGE.broadside + reach) continue;
-        if (Math.abs(e.y - P.y) > band + reach) continue;
-        if (!e.isBoss && !inTraverse(t, Math.atan2(e.y - y, e.x - x))) continue;
-        const d = dx + Math.abs(e.y - y) * 0.7 + (EN[e.type as EnemyType]?.salvage ? 300 : 0); if (d < bd) { bd = d; best = e; }
-      }
-    }
-    return best;
-  }
-  return null;
+  return best;
 }
 function fireWeapons(dt: number) {
   const P = S.P!, o = S.overdrive;
@@ -892,9 +950,8 @@ function fireWeapons(dt: number) {
       continue;
     }
     if (m.arc === 'broadside') {
-      const tg = arcTarget(m, x, y);
-      if (!tg) { P.cds[p.uid] = 0.08; continue; }
-      const side = m.side || (tg.x < x ? -1 : 1), v = S.volley[side < 0 ? 0 : 1];
+      if (!arcTarget(m, x, y)) { P.cds[p.uid] = 0.08; continue; }
+      const v = S.volley[m.side < 0 ? 0 : 1];
       if (!v.queue.some((q) => q.m === m)) v.queue.push({ at: 0, m });
       P.cds[p.uid] = Infinity; // armed: the volley releases it
       continue;
@@ -902,7 +959,7 @@ function fireWeapons(dt: number) {
     const ok = fireWeapon(p, m, x, y, 1);
     if (ok) fireLog.set(p.uid, S.t);
     P.cds[p.uid] = ok ? wCd(p) * (p.id === 'rail' ? P.dv.mods.railCdMul : 1) : 0.1;
-    if (ok && p.id !== 'pd' && p.id !== 'tesla' && m.arc !== 'ventral') muzzle(x, y - 7, WEAPONS[p.id].col, p.id === 'rail' ? 20 : 10);
+    if (ok && p.id !== 'pd' && p.id !== 'tesla' && m.arc !== 'ventral') muzzle(x + Math.cos(lastAim) * 7, y + Math.sin(lastAim) * 7, WEAPONS[p.id].col, p.id === 'rail' ? 20 : 10);
   }
   updateVolleys(dt);
 }
@@ -922,7 +979,7 @@ function updateVolleys(dt: number) {
     const armedQ = v.queue.filter((q) => q.at === 0);
     if (armedQ.length && !v.queue.some((q) => q.at > 0)) {
       v.wait += dt;
-      const need = P.dv.mounts.filter((m) => m.arc === 'broadside' && m.part && m.side === side).length;
+      const need = P.dv.mounts.filter((m) => m.arc === 'broadside' && m.part && m.side === side && m.trav.sectors.length).length;
       if (armedQ.length < need && v.wait < BROADSIDE.gather) continue;
       const guns = armedQ.map((q) => q.m).sort((a, b) => b.oy - a.oy), n = guns.length;
       const rounds = guns.map((m) => broadsideRounds(m.part!)), maxR = Math.max(...rounds);
@@ -933,7 +990,7 @@ function updateVolleys(dt: number) {
       guns.forEach((m, gi) => { P.cds[m.part!.uid] = Math.max(BROADSIDE.period, wCd(m.part!) * rounds[gi]) * (m.part!.id === 'rail' ? P.dv.mods.railCdMul : 1) + k * BROADSIDE.stagger; });
       (v as any).n = n;
       S.stats.broadsides++; S.stats.maxVolley = Math.max(S.stats.maxVolley, n);
-      emit({ type: 'broadside', x: P.x + side * P.dv.width / 2, y: P.y, side, n, kind: String(k) });
+      emit({ type: 'broadside', x: P.x + side * P.dv.width / 2, y: P.y + guns.reduce((s, m) => s + m.oy, 0) / n, side, n, kind: String(k) });
       V.shake = Math.min(14, V.shake + 2 + n * 1.5);
       if (k >= 6) requestStop(S.stop, 0.025 + 0.01 * Math.min(4, n));
     }
@@ -941,26 +998,32 @@ function updateVolleys(dt: number) {
     for (const q of v.queue) {
       if (q.at <= 0 || q.at > S.time) continue;
       q.at = -1;
-      const m = q.m, p = m.part!, x = P.x + m.ox + side * P.dv.width * 0.12, y = P.y + m.oy;
-      if (fireWeapon(p, m, x, y, mul, side)) fireLog.set(p.uid, S.t);
-      muzzle(x + side * 10, y, WEAPONS[p.id].col, 16);
-      addFx({ type: 'smoke', x: x + side * 14, y, vx: side * rnd(60, 120), vy: rnd(-10, 10), life: 0.9, max: 0.9, size: 6, grow: 2.2, a: 0.45, drag: 2 });
+      // the muzzle is the sponson itself (its real place along the keel), and the round leaves along its bearing
+      const m = q.m, p = m.part!, x = P.x + m.ox, y = P.y + m.oy;
+      if (fireWeapon(p, m, x, y, mul)) fireLog.set(p.uid, S.t);
+      const cs = Math.cos(lastAim), sn = Math.sin(lastAim);
+      muzzle(x + cs * 10, y + sn * 10, WEAPONS[p.id].col, 16);
+      addFx({ type: 'smoke', x: x + cs * 14, y: y + sn * 14, vx: cs * rnd(60, 120), vy: sn * rnd(60, 120), life: 0.9, max: 0.9, size: 6, grow: 2.2, a: 0.45, drag: 2 });
     }
     v.queue = v.queue.filter((q) => q.at !== -1);
   }
 }
-function fireWeapon(p: Part, m: Mount, x: number, y: number, mul: number, side = 0): boolean {
+/** Field angle of the last shot fireWeapon aimed (muzzle flashes and smoke follow it). */
+let lastAim = -Math.PI / 2;
+function fireWeapon(p: Part, m: Mount, x: number, y: number, mul: number): boolean {
   const d = wDmg(p) * mul, c = WEAPONS[p.id].col, arc = m.arc, trav = m.trav;
-  // aim direction for bow, top-deck and broadside guns, held inside the mount's traverse
+  // aim for bow, top-deck and broadside guns: a bearing inside the mount's masked traverse, or (a broadside round with
+  // its target gone, a missile) along its facing, held inside the traverse
   let a = -Math.PI / 2, tg: Ent | null = null;
   if (arc === 'bow' || arc === 'broadside' || arc === 'dorsal') {
-    tg = arcTarget(m, x, y);
-    if (!tg && arc !== 'broadside' && p.id !== 'missile') return false;
-    if (arc === 'broadside') {
-      const base = side < 0 ? Math.PI : 0;
-      a = tg ? base + clamp(angDiff(Math.atan2(tg.y - y, tg.x - x), base), -TRAVERSE.broadside, TRAVERSE.broadside) : base;
-    } else if (tg) a = clampTraverse(trav, Math.atan2(tg.y - y, tg.x - x));
+    const hit = arcTarget(m, x, y);
+    if (!hit && arc !== 'broadside' && p.id !== 'missile') return false;
+    if (!trav.sectors.length) return false; // the hull masks it completely
+    tg = hit?.e ?? null; a = hit ? hit.a : restAngle(m);
   }
+  lastAim = a;
+  /** Any spread of rounds stays inside the traverse too. */
+  const inArc = (aa: number) => (trav.sectors.length && arc !== 'ventral' && arc !== 'omni' ? clampTraverse(trav, aa) : aa);
   // Bolts engage what the mount can engage: top-deck guns cannot hit the ground.
   const lay = trav.layers === 'air' ? 'air' : trav.layers === 'ground' ? 'ground' : 'both';
   // Broadside guns (and bow flak) shelling a ground target lob a shell onto it instead of a flat bolt; other bow guns
@@ -972,16 +1035,16 @@ function fireWeapon(p: Part, m: Mount, x: number, y: number, mul: number, side =
   }
   switch (p.id) {
     case 'pulse': S.pb.push(bolt(x, y, Math.cos(a) * 760, Math.sin(a) * 760, d, lay, c, 3.5)); sfx('pew', { x, layer: 'ship' }); return true;
-    case 'spread': { const n = p.tier >= 3 ? 5 : 3; for (let i = 0; i < n; i++) { const aa = a + (i - (n - 1) / 2) * 0.15; S.pb.push(bolt(x, y, Math.cos(aa) * 640, Math.sin(aa) * 640, d, lay, c, 3)); } sfx('spread', { x, layer: 'ship' }); return true; }
+    case 'spread': { const n = p.tier >= 3 ? 5 : 3; for (let i = 0; i < n; i++) { const aa = inArc(a + (i - (n - 1) / 2) * 0.15); S.pb.push(bolt(x, y, Math.cos(aa) * 640, Math.sin(aa) * 640, d, lay, c, 3)); } sfx('spread', { x, layer: 'ship' }); return true; }
     case 'flak': {
       const dist = tg ? clamp(Math.hypot(tg.x - x, tg.y - y), 80, 700) : 260;
       const b = bolt(x, y, Math.cos(a) * 560, Math.sin(a) * 560, d, lay, c, 4); Object.assign(b, { kind: 'flak', life: dist / 560, aoe: 56 }); S.pb.push(b); sfx('flak', { x, layer: 'ship' }); return true;
     }
     case 'missile': {
-      const sx = arc === 'broadside' ? side : 0;
+      // the pair leaves the pod either side of its bearing, then homes
       for (const s of [-1, 1]) {
-        const vx = sx ? sx * 300 : s * 130, vy = sx ? s * 80 : -160;
-        const b = bolt(x + s * 4, y, vx, vy, d, lay, c, 3); Object.assign(b, { kind: 'missile', turn: 5, speed: 470, life: 2.6 }); S.pb.push(b);
+        const la = inArc(a + s * 0.45);
+        const b = bolt(x + s * 4, y, Math.cos(la) * 260, Math.sin(la) * 260, d, lay, c, 3); Object.assign(b, { kind: 'missile', turn: 5, speed: 470, life: 2.6 }); S.pb.push(b);
       }
       sfx('missile', { x, layer: 'ship' }); return true;
     }
@@ -997,8 +1060,9 @@ function fireWeapon(p: Part, m: Mount, x: number, y: number, mul: number, side =
     }
     case 'artillery': {
       const P = S.P!;
-      const tg2 = nearest(P.x, P.y, (e) => (e.layer === 'ground' && !EN[e.type as EnemyType].salvage), ARC_RANGE.mortar)
-        ?? nearest(P.x, P.y, (e) => e.layer === 'ground', ARC_RANGE.mortar);
+      const reach = m.range || RANGE.artillery;
+      const tg2 = nearest(x, y, (e) => (e.layer === 'ground' && !EN[e.type as EnemyType].salvage), reach)
+        ?? nearest(x, y, (e) => e.layer === 'ground', reach);
       const tx = tg2 ? tg2.x : P.x + rnd(-260, 260), ty = tg2 ? (tg2.isBoss ? tg2.y : tg2.y + S.scroll * 0.6) : P.y - rnd(80, 320);
       shell(x, y, tx, ty, d, c, 36, 0.6); sfx('mortar', { x, layer: 'ship' }); return true;
     }
@@ -1007,7 +1071,7 @@ function fireWeapon(p: Part, m: Mount, x: number, y: number, mul: number, side =
       return true;
     }
     case 'tesla': {
-      let cx = x, cy = y, range: number = ARC_RANGE.tesla, any = false; const hit = new Set<Ent>();
+      let cx = x, cy = y, range: number = m.range || RANGE.tesla, any = false; const hit = new Set<Ent>();
       for (let k = 0; k < 2 + p.tier; k++) {
         let best: Ent | null = null, bd = range;
         for (const e of allTargets()) { if (e.dead || hit.has(e) || !layersHit(trav.layers, e.layer)) continue; const dd = Math.hypot(e.x - cx, e.y - cy) - (e.isBoss ? e.r * 0.6 : 0); if (dd < bd) { bd = dd; best = e; } }
@@ -1018,7 +1082,7 @@ function fireWeapon(p: Part, m: Mount, x: number, y: number, mul: number, side =
       if (any) sfx('zap', { x, y }); return any;
     }
     case 'pd': {
-      let best: Ent | null = null, bd = 170 * 170;
+      const pr = m.range || RANGE.pd; let best: Ent | null = null, bd = pr * pr;
       for (const b of S.eb) { if (b.kind === 'beam' || b.kind === 'strike' || b.dead) continue; const dd = (b.x - x) ** 2 + (b.y - y) ** 2; if (dd < bd) { bd = dd; best = b; } }
       if (!best) return false;
       best.dead = true; S.beams.push({ x1: x, y1: y, x2: best.x, y2: best.y, col: c, life: 0.12, max: 0.12, w: 1.5 }); spark(best.x, best.y, c, 4); sfx('pd', { x, layer: 'ship' }); return true;
@@ -1164,6 +1228,7 @@ function updateEnemies(dt: number) {
   const onField = (e: Enemy) => live && e.y > 10 && e.y < H - 30 && e.x > 0 && e.x < W;
   for (const e of S.enemies) {
     if (e.dead) continue;
+    if (e.warnT > 0) { e.warnT -= dt; e.tele = 0; continue; } // a rear entry holding off the bottom edge (telegraphed)
     e.t += dt; e.flash -= dt; e.cd -= dt; shooter = e.type;
     if (e.layer === 'ground' && e.type !== 'crawler') e.y += S.scroll * dt;
     const inRange = onField(e) && hullDist(e.x, e.y) <= (EN[e.type].range ?? 9999);
@@ -1171,14 +1236,22 @@ function updateEnemies(dt: number) {
       case 'heli': {
         if (e.t > e.life) { e.y -= 120 * dt; e.hdg = -Math.PI / 2; if (e.y < -40) e.dead = true; break; }
         e.restation -= dt;
-        if (!e.station || e.restation <= 0) { e.station = flankPoint(e.x < P.x ? -1 : 1, rnd(300, 500)); e.restation = rnd(3.5, 5.5); }
+        if (!e.station || e.restation <= 0) { e.station = e.quarter ? quarterPoint(e.quarter, rnd(240, 420)) : flankPoint(e.x < P.x ? -1 : 1, rnd(300, 500)); e.restation = rnd(3.5, 5.5); }
         steerTo(e, e.station.x, e.station.y, 120, dt);
         e.ang = aimAng(e.x, e.y);
         windup(e, dt, 0.45, inRange, () => { eShot(e.x, e.y, aimNoisy(e.x, e.y), bspd()); }, 3.0);
         break;
       }
       case 'jet':
-        if (e.strafe) {
+        if (e.overtake) {
+          // climbing past the hull from astern: fire once in range, edge away from the side of the hull, leave ahead
+          e.y += e.vy * dt; e.hdg = -Math.PI / 2;
+          const gap = Math.abs(e.x - P.x) - P.dv.width / 2;
+          if (gap < 70 && Math.abs(e.y - P.y) < P.dv.len / 2 + 120) e.x += Math.sign(e.x - P.x || 1) * 260 * dt;
+          // one snap shot as it draws level with the stern (no fan: it is going too fast to line one up)
+          if (!e.fired && e.y < Math.min(H - 40, P.y + P.dv.len / 2 + 40) && inRange) { e.fired = true; eShot(e.x, e.y, aimAng(e.x, e.y), bspd() * 1.2); }
+          if (e.y < -60) e.dead = true;
+        } else if (e.strafe) {
           e.x += e.vx * dt; e.hdg = e.vx > 0 ? 0 : Math.PI;
           // pull clear of the hull if the dreadnought moves into the strafing lane
           const lane = P.dv.len / 2 + 30, dy = e.y - P.y;
@@ -1195,12 +1268,13 @@ function updateEnemies(dt: number) {
         }
         break;
       case 'drone':
-        e.y += 105 * dt; e.x = e.baseX + Math.sin(e.t * 2.4 + e.phase) * 80; e.hdg = Math.PI / 2;
+        e.y += (e.dir ?? 1) * 105 * dt; e.x = e.baseX + Math.sin(e.t * 2.4 + e.phase) * 80; e.hdg = (e.dir ?? 1) * Math.PI / 2;
+        if (e.dir < 0 && e.y < -40) e.dead = true;
         if (e.cd <= 0) { e.cd = rnd(2.5, 4); if (inRange && Math.random() < 0.3) eShot(e.x, e.y, aimNoisy(e.x, e.y), bspd() * 0.8, { r: 3.5, dmg: edmg() * 0.6 }); }
         break;
       case 'gunship': {
         if (e.t > e.life) { e.x += (e.side < 0 ? -1 : 1) * 90 * dt; if (e.x < -60 || e.x > W + 60) e.dead = true; break; }
-        const st = flankPoint(e.side, 400);
+        const st = e.quarter ? quarterPoint(e.quarter, 380) : flankPoint(e.side, 400);
         steerTo(e, st.x, st.y, 70, dt); e.hdg = aimAng(e.x, e.y); e.ang = e.hdg;
         windup(e, dt, 0.8, inRange, () => { const a = aimAng(e.x, e.y); for (let i = -2; i <= 2; i++) eShot(e.x, e.y, a + i * 0.16, bspd() * 0.9); }, 3.2);
         break;
@@ -1237,7 +1311,7 @@ function updateEnemies(dt: number) {
       case 'crawler': updateCrawler(e, dt, onField(e)); break;
       case 'carrier': updateCarrier(e, dt, onField(e)); break;
     }
-    if (!EN[e.type].elite && (e.y > H + 60 || e.x < -100 || e.x > W + 100)) e.dead = true;
+    if (!EN[e.type].elite && ((e.y > H + 60 && !(e.aft && e.t < 6)) || e.x < -100 || e.x > W + 100)) e.dead = true;
     if (S.mode === 'play' && e.layer === 'air' && !e.dead && !EN[e.type].elite && shipHit(e.x, e.y, e.r * 0.7, P.x, P.y, P.dv, 1, 1)) {
       // Ramming: the dreadnought wins every collision; aircraft only scratch the paint.
       if (EN[e.type].salvage) damageTarget(e, 999); else { damagePlayer(1.5 + e.r * 0.12, 'ram:' + e.type); damageTarget(e, 999); }
@@ -1249,12 +1323,13 @@ function elitePhase(e: Enemy) { if (!e.phase2 && e.hp < e.maxHp * 0.5) { e.phase
 /** Ace gunship: circles the dreadnought at broadside range, sweeping a laser sight before each burst. */
 function updateAce(e: Enemy, dt: number, fire: boolean) {
   const P = S.P!, rage = elitePhase(e);
-  // Runs: take a flank station level with the hull, hold and fire, then cross over the bow to the other flank.
+  // Runs: take a flank station level with the hull (some off its aft quarter: 12% in sector 1, 28% from 3), hold and
+  // fire, then cross over the bow to the other flank.
   e.restation = (e.restation ?? 0) - dt;
-  if (!e.station || e.restation <= 0) { e.dir = -(e.dir || 1); e.station = { side: e.dir, dist: rnd(380, 520), dy: rnd(-0.4, 0.4) }; e.restation = rnd(3.2, 4.2) / rage; }
+  if (!e.station || e.restation <= 0) { e.dir = -(e.dir || 1); e.station = { side: e.dir, dist: rnd(380, 520), dy: Math.random() < 0.12 + 0.08 * clamp(S.sector - 1, 0, 2) ? rnd(0.55, 0.8) : rnd(-0.4, 0.4) }; e.restation = rnd(3.2, 4.2) / rage; }
   const st = e.station, tx = clamp(P.x + st.side * st.dist, 60, W - 60), ty = clamp(P.y + st.dy * P.dv.len, 80, H - 60);
   const crossing = Math.sign(e.x - P.x) !== st.side && Math.abs(e.x - P.x) < st.dist;
-  steerTo(e, tx, crossing ? Math.min(ty, P.y - P.dv.len / 2 - 140) : ty, e.t < 3 ? 260 : 230 * rage, dt); e.ang = aimAng(e.x, e.y);
+  steerTo(e, tx, crossing ? Math.max(70, Math.min(ty, P.y - P.dv.len / 2 - 140)) : ty, e.t < 3 ? 260 : 230 * rage, dt); e.ang = aimAng(e.x, e.y);
   windup(e, dt, 0.65, fire && !crossing, () => { const a = aimAng(e.x, e.y); for (let i = 0; i < 4; i++) eShot(e.x, e.y, a + (i - 1.5) * 0.05, bspd() * (1.15 - i * 0.04)); muzzle(e.x, e.y, '#ff7a5c', 14); }, 2.6 / rage);
   e.cd2 -= dt; if (e.cd2 <= 0 && fire) { e.cd2 = 6 / rage; ring(e.x, e.y, 12, bspd() * 0.6, { r: 5, col: '#ff7a6b' }); }
   e.cd3 -= dt; if (e.cd3 <= 0 && fire) { e.cd3 = 5.5; for (const s of [-1, 1]) eShot(e.x + s * 20, e.y, e.ang + s * 0.9, 140, { kind: 'missile', turn: 2.0, spd: 170, hp: 6 * hpMult(), life: 5, r: 5, col: '#ff9f5a', dmg: edmg() * 2 }); }
@@ -1292,7 +1367,7 @@ function updateEB(dt: number) {
     if (b.kind === 'beam') {
       // a ghost's broadside rail rides with its gun as the ship moves; the line keeps its angle
       const G = S.boss;
-      if (b.gun && G && G.alive) { const p = bossGunPos(G, b.gun, b.side), dx = p.x - b.x, dy = p.y - b.y; b.x += dx; b.y += dy; b.x2 += dx; b.y2 += dy; }
+      if (b.gun && G && G.alive) { const p = bossGunPos(G, b.gun), dx = p.x - b.x, dy = p.y - b.y; b.x += dx; b.y += dy; b.x2 += dx; b.y2 += dy; }
       if (!b.charged) { b.charged = true; sfx('railCharge', { x: b.x, y: b.y, layer: 'air' }); }
       if (b.t >= b.warn && !b.fired) {
         b.fired = true; sfx('rail', { x: b.x, layer: 'air' }); V.shake = Math.min(10, V.shake + 5); V.flashA = Math.max(V.flashA, 0.12);
