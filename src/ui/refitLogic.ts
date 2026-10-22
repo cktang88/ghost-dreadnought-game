@@ -2,7 +2,7 @@
 // leader line runs to the mount, what a drag would do (valid or not, and why), and the stat deltas it previews.
 // No DOM here, so tests/unit/refitBoard.test.ts can hold the layout to "no overlaps, no crossed leaders".
 import {
-  SECTIONS, derive, isWeapon, layersHit, mountFacing, nextFacing, partDef, partSlot, wCd, wDmg,
+  SECTIONS, RING_MAX, canPlace, derive, layoutIssue, layoutOf, isWeapon, layersHit, mountFacing, mountRing, nextFacing, pinLayout, ringCost, partDef, partSlot, wCd, wDmg,
   type Build, type Derived, type Mods, type Part, type SlotKind,
 } from '../data/parts';
 
@@ -60,7 +60,9 @@ export function applyMove(b: Build, inv: Part[], src: Src, dst: Dst) {
   else { inv.splice(src.i, 1); if (cur) inv.push(cur); sec.slots[dst.i] = p; }
 }
 
-const cloneBuild = (b: Build): Build => ({ sections: b.sections.map((s) => ({ type: s.type, slots: s.slots.slice(), ...(s.face ? { face: s.face.slice() } : {}) })) });
+const cloneBuild = (b: Build): Build => ({ sections: b.sections.map((s) => ({
+  type: s.type, slots: s.slots.slice(), ...(s.face ? { face: s.face.slice() } : {}), ...(s.ring ? { ring: s.ring.slice() } : {}), ...(s.at ? { at: [s.at[0], s.at[1]] as [number, number] } : {}),
+})) });
 /** The build a move would leave (for previews); the real build is untouched. */
 export function previewMove(b: Build, inv: Part[], src: Src, dst: Dst): Build | null {
   if (!checkMove(b, inv, src, dst).ok) return null;
@@ -95,8 +97,34 @@ export function rotateMount(b: Build, si: number, i: number, dir: 1 | -1) {
   return true;
 }
 export function previewRotate(b: Build, si: number, i: number, dir: 1 | -1) { const nb = cloneBuild(b); return rotateMount(nb, si, i, dir) ? nb : null; }
+/** The scrap a ring refit of mount (si, i) to the next level costs, or null at the best ring / not a weapon mount. */
+export function ringUpgradeCost(b: Build, si: number, i: number): number | null {
+  const s = b.sections[si]; if (!s || SECTIONS[s.type].slots[i] !== 'W') return null;
+  const lv = mountRing(s, i);
+  return lv >= RING_MAX ? null : ringCost(lv + 1);
+}
+/** Fit the next turret ring to mount (si, i) (the caller pays ringUpgradeCost). Call inside changeBuild(). */
+export function upgradeRing(b: Build, si: number, i: number) {
+  if (ringUpgradeCost(b, si, i) === null) return false;
+  const s = b.sections[si];
+  s.ring = SECTIONS[s.type].slots.map((_, k) => mountRing(s, k));
+  s.ring[i] = mountRing(s, i) + 1;
+  return true;
+}
+/** Move module si to grid spot `at` (design units; the rest of the ship is pinned where it is). Call inside changeBuild(). */
+export function placeModule(b: Build, si: number, at: [number, number]) {
+  if (!b.sections[si] || canPlace(b, si, at)) return false;
+  pinLayout(b); b.sections[si].at = at;
+  return true;
+}
+export function previewPlace(b: Build, si: number, at: [number, number]) { const nb = cloneBuild(b); return placeModule(nb, si, at) ? nb : null; }
 /** Cutting a section loose: never the bridge; its parts land in the hold. Call inside changeBuild(). */
-export const canCutSection = (b: Build, si: number) => !!b.sections[si] && b.sections[si].type !== 'bridge';
+export function canCutSection(b: Build, si: number) {
+  if (!b.sections[si] || b.sections[si].type === 'bridge') return false;
+  // On a placed grid the rest must stay one joined hull.
+  const lay = layoutOf(b);
+  return !b.sections.some((s) => s.at) || !layoutIssue({ sections: b.sections.filter((_, k) => k !== si) }, lay.filter((_, k) => k !== si));
+}
 export function cutSection(b: Build, inv: Part[], si: number) {
   if (!canCutSection(b, si)) return null;
   const [s] = b.sections.splice(si, 1);

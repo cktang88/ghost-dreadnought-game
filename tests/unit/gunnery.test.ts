@@ -37,7 +37,7 @@ describe('weapon control split', () => {
 });
 
 describe('mount traverse arcs', () => {
-  it('bow mounts get a forward cone for air and ground, top-deck turrets a 240° arc around their facing for air only', () => {
+  it('bow mounts get a forward cone for air and ground, top-deck turrets a ring-sized arc around their facing for air only', () => {
     const bow = mountTraverse('bridge', 'W', 'pulse');
     expect(bow).toMatchObject({ arc: 'bow', layers: 'both', sectors: [{ c: 0, h: TRAVERSE.bow }] });
     const top = mountTraverse('gundeck', 'W', 'pulse');
@@ -48,8 +48,10 @@ describe('mount traverse arcs', () => {
     expect(inTraverse(bow, -PI / 2 + TRAVERSE.bow - 0.01)).toBe(true);
     expect(inTraverse(bow, 0)).toBe(false);
     expect(inTraverse(bow, PI / 2)).toBe(false);
-    for (const a of [-PI / 2, 0, PI]) expect(inTraverse(top, a)).toBe(true);
-    expect(inTraverse(top, PI / 2)).toBe(false); // dead astern is outside a forward-facing turret's arc
+    expect(inTraverse(top, -PI / 2)).toBe(true);
+    expect(inTraverse(top, 0)).toBe(false); // a standard ring (120°) does not reach abeam
+    expect(inTraverse(mountTraverse('gundeck', 'W', 'pulse', 0, 2), 0)).toBe(true); // a wide ring (180°) does
+    for (const a of [0, PI / 2, PI]) expect(inTraverse(mountTraverse('gundeck', 'W', 'pulse', 0, 3), a)).toBe(true); // full ring
     const aft = mountTraverse('gundeck', 'W', 'pulse', 4);
     expect(inTraverse(aft, PI / 2)).toBe(true);
     expect(inTraverse(aft, -PI / 2)).toBe(false);

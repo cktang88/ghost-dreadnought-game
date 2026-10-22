@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { derive, mkPart, inTraverse, mountTraverse, allowedFacings, mountFacing, buildToGhost, ghostToBuild, starterBuild, type Build } from '../../src/data/parts';
-import { rotateMount } from '../../src/ui/refitLogic';
+import { derive, mkPart, inTraverse, mountTraverse, SECTIONS, RANGE, canPlace, pinLayout, layoutIssue, layoutOf, attachSpots, mountRing, allowedFacings, mountFacing, buildToGhost, ghostToBuild, starterBuild, type Build } from '../../src/data/parts';
+import { rotateMount, placeModule, canCutSection, upgradeRing } from '../../src/ui/refitLogic';
 import { validateGhost } from '../../server/validate.mjs';
 
 const UP = -Math.PI / 2, DOWN = Math.PI / 2;
@@ -87,5 +87,53 @@ describe('facing', () => {
     expect(mountFacing(back.sections[0], 0)).toBe(1);
     expect(mountFacing(back.sections[1], 1)).toBe(3);
     expect(mountFacing({ type: 'bridge', slots: [null], face: [4] }, 0)).toBe(0); // a bridge gun cannot face aft
+  });
+});
+
+describe('module grid', () => {
+  const base = (): Build => ({ sections: [
+    { type: 'bridge', slots: [mkPart('pulse', 1)] },
+    { type: 'battery', slots: [mkPart('pulse', 1), null, mkPart('pulse', 1)] },
+    { type: 'gundeck', slots: [mkPart('pulse', 1), null] },
+  ] });
+  it('modules can sit side by side, making a wider ship', () => {
+    const b = base();
+    expect(placeModule(b, 2, [SECTIONS.battery.w / 2 + SECTIONS.gundeck.w / 2, 30])).toBe(true);
+    const d = derive(b);
+    expect(d.width).toBeGreaterThan(derive(base()).width);
+    // the gun deck beside the battery now masks its starboard sponson
+    const stbd = d.mounts.find((m) => m.si === 1 && m.i === 2)!;
+    expect(stbd.trav.blocked.some((s) => s.by === 'gundeck')).toBe(true);
+  });
+  it('refuses overlaps and loose modules; cutting cannot split the hull', () => {
+    const b = base();
+    expect(canPlace(b, 2, [0, 0])).toMatch(/overlap/);
+    expect(canPlace(b, 2, [200, 0])).toMatch(/join/);
+    pinLayout(b);
+    expect(canCutSection(b, 1)).toBe(false); // the battery holds the gun deck to the bridge
+    expect(canCutSection(b, 2)).toBe(true);
+  });
+  it('a new module without a spot goes astern; spots to attach are offered', () => {
+    const b = base(); pinLayout(b);
+    b.sections.push({ type: 'engine', slots: [null] });
+    expect(layoutIssue(b)).toBe(null);
+    expect(attachSpots(b, 'engine').length).toBeGreaterThan(4);
+  });
+  it('turret rings widen the arc: 120 -> 180 -> 360 on the top deck', () => {
+    const b: Build = { sections: [{ type: 'gundeck', slots: [mkPart('pulse', 1), null] }, { type: 'bridge', slots: [null] }] };
+    const span = () => derive(b).mounts[0].trav.sectors.reduce((n, s) => n + 2 * s.h, 0);
+    expect(span()).toBeCloseTo((2 * Math.PI) / 3, 1);
+    expect(upgradeRing(b, 0, 0)).toBe(true);
+    expect(span()).toBeCloseTo(Math.PI, 1);
+    expect(upgradeRing(b, 0, 0)).toBe(true);
+    expect(span()).toBeGreaterThan(1.8 * Math.PI - 0.6); // full ring, less the bridge tower astern
+    expect(upgradeRing(b, 0, 0)).toBe(false);
+    expect(derive(b).mounts[0].range).toBe(RANGE.dorsal);
+  });
+  it('grid places, rings and facings survive the ghost round trip', () => {
+    const b = base(); placeModule(b, 2, [SECTIONS.battery.w / 2 + SECTIONS.gundeck.w / 2, 30]); upgradeRing(b, 0, 0);
+    const back = ghostToBuild(validateGhost({ sector: 1, sections: buildToGhost(b), name: 'x', pilot: 'p' })!.sections);
+    expect(layoutOf(back)).toEqual(layoutOf(b));
+    expect(mountRing(back.sections[0], 0)).toBe(2);
   });
 });

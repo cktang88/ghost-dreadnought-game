@@ -87,20 +87,34 @@ section order really moves guns along the keel. `slotPos(type, i)` places mounts
 on the centreline fore and aft, battery sponsons port and starboard with a centreline casemate between. Any section, the bridge too,
 may sit anywhere in the order.
 
+**Module grid.** Modules are placed on a grid (`Section.at` = [centre x from the keel line, forward y], design units, multiples of
+`GRID`), so a ship can be any joined shape: a single column, a wide hammerhead, outrigger batteries. `layoutOf(build)` gives every
+module's spot (`autoLayout` stacks a column when none is placed; a module without a spot goes astern on the keel line).
+`layoutIssue` refuses overlaps and modules that do not join the hull edge to edge; `canPlace`, `attachSpots`, `pinLayout` and
+`placeModule` / `canCutSection` (refitLogic.ts) keep the ship in one piece. `derive` centres the ship on its bounding box.
+
 **Facing.** Every weapon mount has a facing (`Facing` 0..7, 45° steps clockwise from the bow: 0 bow, 2 starboard, 4 stern, 6 port),
 stored per slot in `Section.face` (it belongs to the mount, not the part). `allowedFacings(type, i)`, `defaultFacing`,
-`mountFacing(section, i)`, `nextFacing` and `rotateMount` (refitLogic.ts) handle it. The arc is centred on the facing:
+`mountFacing(section, i)`, `nextFacing` and `rotateMount` (refitLogic.ts) handle it.
+
+**Turret rings.** Every weapon mount has a ring level (`Section.ring`, 1..`RING_MAX` 3, `mountRing`); a refit (`upgradeRing`, scrap
+`ringCost(level)`: 60, then 140) widens the arc. Half-widths by level in `RING`: top deck 120° / 180° / 360°, sponson 90° / 130° /
+its whole side, bridge gun 70° / 100° / 140°. `TRAVERSE` is the standard ring.
 
 | Arc | Mounts | Facings | Traverse about the facing | Engages |
 | --- | --- | --- | --- | --- |
-| `bow` | Command Bridge | fore, fore-port, fore-starboard | ±`TRAVERSE.bow` (0.8 rad), clipped to the forward half | air and ground |
-| `dorsal` | Gun Deck turrets (top deck) | any | ±`TRAVERSE.dorsal` (2.1 rad, 240°) | air only: they cannot depress below the hull |
-| `broadside` | Broadside Battery | outboard on its side: fore / abeam / aft quarter (the centre casemate either side) | ±`TRAVERSE.broadside` (1.05 rad), clipped to its own side | air and ground |
+| `bow` | Command Bridge | fore, fore-port, fore-starboard | `RING.bow`, clipped to the forward half | air and ground |
+| `dorsal` | Gun Deck turrets (top deck) | any | `RING.dorsal` | air only: they cannot depress below the hull |
+| `broadside` | Broadside Battery | outboard on its side: fore / abeam / aft quarter (the centre casemate either side) | `RING.broadside`, clipped to its own side | air and ground |
 | `ventral` | any bomb bay or mortar | ignored | falls (`down: true`) | ground only; a flying ghost is out of reach |
 | `omni` | point defense, arc coils | ignored | all round | PD: enemy fire (`shots`); coils: air from the top deck, air and ground elsewhere |
 
+**Ranges.** `RANGE` / `mountRange(arc, partId)` (also `Mount.range`): bridge gun 1000, top deck 720, broadside 760, bombs 420, mortars
+640, arc coils 240, point defense 200 field units.
+
 **Hull shadows.** `hullObstacles(rects)` lists what stands in the way: the bridge tower and engine funnels (tall: they block the bridge
-gun and top-deck turrets of other sections) and battery sponsons (wide: they block sponsons on the same side of other batteries).
+gun and top-deck turrets of other modules) and every module's hull (it blocks sponsons of other modules: a sponson cannot fire
+through the ship, so a module beside or ahead of a battery masks it).
 `hullShadows(trav, x, y, si, obstacles)` removes the bearings each obstacle subtends from the mount (a turret right behind the tower
 loses about ±31° dead ahead, one far aft only a few degrees), so sectors can come out in two pieces, and records them in
 `trav.blocked` (`{ c, h, by }`). `Derived.obstacles` keeps the list; `traverseIn(d, si, i, partId)` previews a part in a mount.
