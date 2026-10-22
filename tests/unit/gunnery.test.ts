@@ -37,29 +37,36 @@ describe('weapon control split', () => {
 });
 
 describe('mount traverse arcs', () => {
-  it('bow mounts get a forward cone for air and ground, top-deck turrets all round for air only', () => {
+  it('bow mounts get a forward cone for air and ground, top-deck turrets a 240° arc around their facing for air only', () => {
     const bow = mountTraverse('bridge', 'W', 'pulse');
     expect(bow).toMatchObject({ arc: 'bow', layers: 'both', sectors: [{ c: 0, h: TRAVERSE.bow }] });
     const top = mountTraverse('gundeck', 'W', 'pulse');
     expect(top).toMatchObject({ arc: 'dorsal', layers: 'air' });
-    expect(top.sectors[0].h).toBeCloseTo(PI);
+    expect(top.sectors[0].h).toBeCloseTo(TRAVERSE.dorsal);
     // player ship: bow points up the screen (field angle -PI/2)
     expect(inTraverse(bow, -PI / 2)).toBe(true);
     expect(inTraverse(bow, -PI / 2 + TRAVERSE.bow - 0.01)).toBe(true);
     expect(inTraverse(bow, 0)).toBe(false);
     expect(inTraverse(bow, PI / 2)).toBe(false);
-    for (const a of [-PI / 2, 0, PI / 2, PI, 2.5]) expect(inTraverse(top, a)).toBe(true);
+    for (const a of [-PI / 2, 0, PI]) expect(inTraverse(top, a)).toBe(true);
+    expect(inTraverse(top, PI / 2)).toBe(false); // dead astern is outside a forward-facing turret's arc
+    const aft = mountTraverse('gundeck', 'W', 'pulse', 4);
+    expect(inTraverse(aft, PI / 2)).toBe(true);
+    expect(inTraverse(aft, -PI / 2)).toBe(false);
   });
-  it('broadside mounts cover their own flank; the centre mount either flank; never across the hull', () => {
-    const port = mountTraverse('battery', 'W', 'pulse', -1), stbd = mountTraverse('battery', 'W', 'pulse', 1), mid = mountTraverse('battery', 'W', 'pulse', 0);
+  it('broadside mounts cover their own flank where they face; never across the hull', () => {
+    const port = mountTraverse('battery', 'W', 'pulse', 6), stbd = mountTraverse('battery', 'W', 'pulse', 2);
     expect(port.layers).toBe('both');
     expect(inTraverse(port, PI)).toBe(true); // straight out to the left
     expect(inTraverse(port, 0)).toBe(false);
     expect(inTraverse(stbd, 0)).toBe(true);
     expect(inTraverse(stbd, PI)).toBe(false);
     expect(inTraverse(stbd, -PI / 2)).toBe(false); // dead ahead is the bow's job
-    expect(inTraverse(mid, 0) && inTraverse(mid, PI)).toBe(true);
-    expect(inTraverse(mid, -PI / 2)).toBe(false);
+    // angled forward, a sponson reaches toward the bow but is clipped at the centreline
+    const fwd = mountTraverse('battery', 'W', 'pulse', 1);
+    expect(inTraverse(fwd, -PI / 2 + 0.05)).toBe(true);
+    expect(inTraverse(fwd, -PI / 2 - 0.05)).toBe(false);
+    expect(inTraverse(fwd, PI / 2 - 0.3)).toBe(false); // nothing aft-starboard any more
   });
   it('ventral ordnance is ground only; point defense hunts shots; coils follow placement', () => {
     expect(mountTraverse('gundeck', 'W', 'bomb')).toMatchObject({ arc: 'ventral', layers: 'ground', down: true });
@@ -80,7 +87,7 @@ describe('mount traverse arcs', () => {
     expect(shipToField(0, true)).toBeCloseTo(PI / 2);
     expect(inTraverse(bow, PI / 2, true)).toBe(true);
     expect(inTraverse(bow, -PI / 2, true)).toBe(false);
-    const stbd = mountTraverse('battery', 'W', 'pulse', 1);
+    const stbd = mountTraverse('battery', 'W', 'pulse', 2);
     expect(inTraverse(stbd, 0, true)).toBe(true); // starboard stays screen-right on the mirrored ghost
   });
   it('derive() stores the traverse on every mount', () => {

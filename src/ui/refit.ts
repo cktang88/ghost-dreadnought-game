@@ -9,7 +9,7 @@ import { icon } from './icons';
 import { gauge, legend, segBar } from './kit';
 import { guardedSwitch } from './screens/pause';
 import {
-  SECTIONS, ARC_INFO, LAYERS_TAG, MAX_SECTIONS, TIER, mountArc, mountTraverse, partDef, partDesc, partName, partSlot, placementNote, weaponControl,
+  SECTIONS, ARC_INFO, LAYERS_TAG, MAX_SECTIONS, TIER, mountArc, traverseIn, partDef, partDesc, partName, partSlot, placementNote, weaponControl,
   derive, isWeapon, type Derived, type Part, type SectionType, type Traverse, type Build,
 } from '../data/parts';
 import { changeBuild, dv, mods, type RunState } from '../game/run';
@@ -47,7 +47,6 @@ const parseDrop = (s: string | undefined): Dst | null => {
   return m ? { k: 'slot', si: +m[1], i: +m[2] } : null;
 };
 /** The flank a mount would fire to with a broadside gun in it, from where it sits (derive() gives 0 when the part in it is, say, a bomb). */
-const sideOf = (d: Derived, si: number, i: number): -1 | 0 | 1 => { const m = d.mounts.find((x) => x.si === si && x.i === i); return !m || d.rects[si].type !== 'battery' ? 0 : m.ox < -1 ? -1 : m.ox > 1 ? 1 : 0; };
 
 /** Board anchors: where each mount is drawn on the plan (the bridge's mount is called out above the ship). */
 const anchorsOf = (d: Derived) => d.mounts.map((m) => {
@@ -108,7 +107,7 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
       class: `mtile ${kind === 'W' ? 'w' : 'u'} ${p ? 'full' : 'empty'}`, 'data-drop': k, 'data-key': k, 'data-slot': `${si}-${i}`,
       style: `--arc:${ARC_INFO[arc].col}`, 'aria-label': `${mountName(type, i)}: ${p ? partName(p) : 'empty'}`,
     });
-    const reach = kind === 'W' ? (p ? mountTraverse(type, kind, p.id, sideOf(d, si, i)) : mountTraverse(type, kind, 'pulse', sideOf(d, si, i))) : null;
+    const reach = kind === 'W' ? (p ? traverseIn(d, si, i, p.id) : traverseIn(d, si, i, 'pulse')) : null;
     t.append(
       el('span', 'mt-n', String(L?.tiles.find((x) => x.id === `${si}-${i}`)?.n ?? '').padStart(2, '0')),
       el('span', 'mt-well', p ? icon(p.id) : el('i', null, kind)),
@@ -173,7 +172,7 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
       t.querySelectorAll('.cand-tag').forEach((x) => x.remove());
       if (c && p && dst.k === 'slot') {
         if (c.ok) {
-          const sec = run.build.sections[dst.si], tr = mountTraverse(sec.type, SECTIONS[sec.type].slots[dst.i], p.id, sideOf(d, dst.si, dst.i));
+          const sec = run.build.sections[dst.si], tr = traverseIn(d, dst.si, dst.i, p.id);
           tags.prepend(el('em', { class: 'cand-tag arc-tag', style: `color:${ARC_INFO[tr.arc].col}` }, ARC_INFO[tr.arc].short));
           if (isWeapon(p.id)) tags.append(el('em', `cand-tag reach-tag ${tr.layers}`, LAYERS_TAG[tr.layers] || '—'));
           const pv = previewMove(run.build, run.inv, pick!, dst), dl = pv ? statDeltas(d, derive(pv, mods(run))) : {};
@@ -195,7 +194,7 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
     const arcFor = (si: number, i: number, cand: boolean, hot: boolean) => {
       const m = show.mounts.find((x) => x.si === si && x.i === i); if (!m) return;
       let tr: Traverse = m.trav;
-      if (cand && p) { const sec = run.build.sections[si]; tr = mountTraverse(sec.type, SECTIONS[sec.type].slots[i], p.id, sideOf(show, si, i)); }
+      if (cand && p) { const sec = run.build.sections[si]; tr = traverseIn(show, si, i, p.id); }
       if (!tr.sectors.length) return;
       const [x, y] = L!.anchors[`${si}-${i}`], col = ARC_INFO[tr.arc].col, big = Math.max(64, Math.min(120, L!.ship.s * 48)), r = hot ? big : big * 0.46;
       const g = svg('g', { class: `arc-w${hot ? ' hot' : ''}${tr.down ? ' down' : ''}`, style: `--arc:${col}` });
@@ -267,7 +266,7 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
     } else if (p) {
       const c = over ? check(over) : null;
       const where = over?.k === 'slot' ? (() => {
-        const sec = run.build.sections[over.si], tr = mountTraverse(sec.type, SECTIONS[sec.type].slots[over.i], p.id, sideOf(d, over.si, over.i));
+        const sec = run.build.sections[over.si], tr = traverseIn(d, over.si, over.i, p.id);
         if (!c?.ok) return el('p', 'rd-no', c?.reason ?? '');
         const out = c.out ? ` ${partName(c.out)} goes to the hold.` : '';
         return el('p', 'rd-go', `→ ${mountName(sec.type, over.i)}: ${isWeapon(p.id) ? `${ARC_INFO[tr.arc].label}, engages ${({ air: 'aircraft only', ground: 'ground targets only', both: 'air and ground', shots: 'enemy fire', none: '—' } as const)[tr.layers]}.` : 'utility bay.'}${out}`);

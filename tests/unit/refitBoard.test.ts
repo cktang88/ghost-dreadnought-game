@@ -126,12 +126,15 @@ describe('refit moves', () => {
     const f2 = firepower(derive(b));
     expect(f2.ground).toBeGreaterThan(0); expect(f2.air).toBeCloseTo(f1.air * 2);
   });
-  it('sections reorder behind the bridge and cut loose into the hold', () => {
+  it('sections reorder anywhere, the bridge too, and cut loose into the hold', () => {
     const b = HULLS.lance.build(), inv: ReturnType<typeof mkPart>[] = [];
-    expect(canMoveSection(b, 0, 2)).toBe(false);
-    expect(canMoveSection(b, 3, 0)).toBe(false);
+    expect(canMoveSection(b, 2, 2)).toBe(false);
+    expect(canMoveSection(b, 9, 0)).toBe(false);
     expect(moveSection(b, 4, 1)).toBe(true);
     expect(b.sections.map((s) => s.type)).toEqual(['bridge', 'engine', 'gundeck', 'gundeck', 'engine']);
+    expect(moveSection(b, 0, 2)).toBe(true);
+    expect(b.sections.map((s) => s.type)).toEqual(['engine', 'gundeck', 'bridge', 'gundeck', 'engine']);
+    expect(moveSection(b, 2, 0)).toBe(true);
     expect(cutSection(b, inv, 0)).toBe(null);
     expect(cutSection(b, inv, 2)!.type).toBe('gundeck');
     expect(inv.map((p) => p.id)).toEqual(['pulse', 'pulse']);

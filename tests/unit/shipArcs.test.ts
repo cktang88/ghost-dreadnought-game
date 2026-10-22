@@ -22,9 +22,9 @@ describe('ship gun traverse (render, on the shared mount traverse)', () => {
     expect(tr(3, 2).kind).toBe('ventral');
   });
 
-  it('dorsal guns are anti-air and train all round', () => {
+  it('dorsal guns are anti-air and train round their facing, short of dead astern', () => {
     expect(tr(1, 0).layer).toBe('air');
-    expect(aimYaw(tr(1, 0), DOWN, false, 0)).toBeCloseTo(Math.PI);
+    expect(Math.abs(aimYaw(tr(1, 0), DOWN, false, 0))).toBeLessThan(Math.PI - 0.5);
   });
 
   it('broadside guns rest outboard and train only across their own beam', () => {

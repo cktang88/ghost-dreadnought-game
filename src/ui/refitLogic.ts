@@ -2,7 +2,7 @@
 // leader line runs to the mount, what a drag would do (valid or not, and why), and the stat deltas it previews.
 // No DOM here, so tests/unit/refitBoard.test.ts can hold the layout to "no overlaps, no crossed leaders".
 import {
-  SECTIONS, derive, isWeapon, layersHit, partDef, partSlot, wCd, wDmg,
+  SECTIONS, derive, isWeapon, layersHit, mountFacing, nextFacing, partDef, partSlot, wCd, wDmg,
   type Build, type Derived, type Mods, type Part, type SlotKind,
 } from '../data/parts';
 
@@ -60,7 +60,7 @@ export function applyMove(b: Build, inv: Part[], src: Src, dst: Dst) {
   else { inv.splice(src.i, 1); if (cur) inv.push(cur); sec.slots[dst.i] = p; }
 }
 
-const cloneBuild = (b: Build): Build => ({ sections: b.sections.map((s) => ({ type: s.type, slots: s.slots.slice() })) });
+const cloneBuild = (b: Build): Build => ({ sections: b.sections.map((s) => ({ type: s.type, slots: s.slots.slice(), ...(s.face ? { face: s.face.slice() } : {}) })) });
 /** The build a move would leave (for previews); the real build is untouched. */
 export function previewMove(b: Build, inv: Part[], src: Src, dst: Dst): Build | null {
   if (!checkMove(b, inv, src, dst).ok) return null;
@@ -71,13 +71,13 @@ export function previewMove(b: Build, inv: Part[], src: Src, dst: Dst): Build | 
   return nb;
 }
 
-/** Hull section order: the bridge stays at the bow; any other section may move to any position behind it. */
+/**
+ * Hull section order: any section, the bridge too, may move to any position. Order decides where every mount sits along
+ * the keel, so what the bridge tower, funnels and sponsons block (hullShadows in data/parts.ts).
+ */
 export function canMoveSection(b: Build, from: number, to: number) {
   const n = b.sections.length;
-  if (from === to || from < 0 || from >= n || to < 0 || to >= n) return false;
-  if (b.sections[from].type === 'bridge') return false;
-  const bridgeAt = b.sections.findIndex((s) => s.type === 'bridge');
-  return bridgeAt < 0 || to > bridgeAt || (to === bridgeAt && from < bridgeAt);
+  return from !== to && from >= 0 && from < n && to >= 0 && to < n;
 }
 /** Move a section to position `to` (insertion, the others close up). Call inside changeBuild(). */
 export function moveSection(b: Build, from: number, to: number) {
@@ -86,6 +86,15 @@ export function moveSection(b: Build, from: number, to: number) {
   return true;
 }
 export function previewSectionMove(b: Build, from: number, to: number) { const nb = cloneBuild(b); return moveSection(nb, from, to) ? nb : null; }
+/** Turn a weapon mount to its next allowed facing (dir 1 clockwise, -1 anticlockwise). Call inside changeBuild(). */
+export function rotateMount(b: Build, si: number, i: number, dir: 1 | -1) {
+  const s = b.sections[si]; if (!s) return false;
+  const f = nextFacing(s, i, dir); if (f === null) return false;
+  const face = SECTIONS[s.type].slots.map((_, k) => mountFacing(s, k) as number);
+  face[i] = f; s.face = face;
+  return true;
+}
+export function previewRotate(b: Build, si: number, i: number, dir: 1 | -1) { const nb = cloneBuild(b); return rotateMount(nb, si, i, dir) ? nb : null; }
 /** Cutting a section loose: never the bridge; its parts land in the hold. Call inside changeBuild(). */
 export const canCutSection = (b: Build, si: number) => !!b.sections[si] && b.sections[si].type !== 'bridge';
 export function cutSection(b: Build, inv: Part[], si: number) {

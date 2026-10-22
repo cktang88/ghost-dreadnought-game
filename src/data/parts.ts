@@ -4,7 +4,15 @@ import { SHIP_SCALE } from '../game/field';
 export type Layer = 'air' | 'ground' | 'both' | 'none';
 export type SlotKind = 'W' | 'U';
 export interface Part { id: string; tier: number; uid: number }
-export interface Section { type: SectionType; slots: (Part | null)[] }
+/**
+ * Mount facing: eight compass steps of 45 degrees, clockwise from the bow (0 bow, 2 starboard, 4 stern, 6 port).
+ * The facing belongs to the mount, not the part: it stays when parts are swapped. See allowedFacings().
+ */
+export type Facing = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
+export const FACING_NAMES = ['bow', 'fore-starboard', 'starboard', 'aft-starboard', 'stern', 'aft-port', 'port', 'fore-port'] as const;
+export const FACING_SHORT = ['F', 'FS', 'S', 'AS', 'A', 'AP', 'P', 'FP'] as const;
+/** `face[i]` is the facing of slot i (weapon mounts only; missing or invalid entries use defaultFacing). */
+export interface Section { type: SectionType; slots: (Part | null)[]; face?: (number | null)[] }
 export interface Build { sections: Section[] }
 
 export interface WeaponDef { name: string; layer: Layer; cd: number; dmg: number; col: string; cost: number; desc: string }
@@ -77,14 +85,20 @@ export const UTILS: Record<string, UtilDef> = {
 
 export type SectionType = 'bridge' | 'gundeck' | 'battery' | 'armor' | 'spine' | 'engine';
 export interface SectionDef { name: string; w: number; h: number; hp: number; mass: number; thrust: number; slots: SlotKind[]; cost: number }
+/**
+ * Sections are long and narrow, like a real capital ship's hull: `w` is the beam (across), `h` the length along the
+ * keel. A Broadside Battery's beam includes its sponsons; the hull itself is about `HULL_BEAM` wide.
+ */
 export const SECTIONS: Record<SectionType, SectionDef> = {
-  bridge: { name: 'Command Bridge', w: 34, h: 24, hp: 60, mass: 2, thrust: 4, slots: ['W'], cost: 0 },
-  gundeck: { name: 'Gun Deck', w: 42, h: 16, hp: 30, mass: 2, thrust: 0, slots: ['W', 'W'], cost: 70 },
-  battery: { name: 'Broadside Battery', w: 60, h: 15, hp: 35, mass: 3, thrust: 0, slots: ['W', 'W', 'W'], cost: 140 },
-  armor: { name: 'Armored Hull', w: 40, h: 16, hp: 90, mass: 3, thrust: 0, slots: ['U'], cost: 60 },
-  spine: { name: 'Utility Spine', w: 32, h: 16, hp: 30, mass: 1.5, thrust: 0, slots: ['U', 'U'], cost: 80 },
-  engine: { name: 'Engine Block', w: 34, h: 16, hp: 25, mass: 1, thrust: 8, slots: ['U'], cost: 55 },
+  bridge: { name: 'Command Bridge', w: 20, h: 30, hp: 60, mass: 2, thrust: 4, slots: ['W'], cost: 0 },
+  gundeck: { name: 'Gun Deck', w: 22, h: 26, hp: 30, mass: 2, thrust: 0, slots: ['W', 'W'], cost: 70 },
+  battery: { name: 'Broadside Battery', w: 30, h: 24, hp: 35, mass: 3, thrust: 0, slots: ['W', 'W', 'W'], cost: 140 },
+  armor: { name: 'Armored Hull', w: 24, h: 18, hp: 90, mass: 3, thrust: 0, slots: ['U'], cost: 60 },
+  spine: { name: 'Utility Spine', w: 19, h: 18, hp: 30, mass: 1.5, thrust: 0, slots: ['U', 'U'], cost: 80 },
+  engine: { name: 'Engine Block', w: 22, h: 20, hp: 25, mass: 1, thrust: 8, slots: ['U'], cost: 55 },
 };
+/** Beam of the hull proper (design units), without sponsons. */
+export const HULL_BEAM = 22;
 export const MAX_SECTIONS = 8;
 export const TIER = ['', 'I', 'II', 'III', 'IV', 'V'];
 
@@ -122,13 +136,14 @@ export interface Rect { x: number; y: number; w: number; h: number; type: Sectio
  *  - omni: point defense (shoots enemy fire) and arc coils (lightning in every direction; air only from the top deck).
  * mountTraverse() gives the exact sectors and target layers; combat, ghosts, the HUD and the ship renderer all read it.
  */
+const wrapPi = (a: number) => { a = (a + Math.PI) % (Math.PI * 2); if (a < 0) a += Math.PI * 2; return a - Math.PI; };
 export type Arc = 'bow' | 'dorsal' | 'broadside' | 'ventral' | 'omni' | 'internal';
 export const ARC_INFO: Record<Arc, { label: string; short: string; col: string; desc: string }> = {
-  bow: { label: 'Bow', short: 'BOW', col: '#4fd1e8', desc: 'Front mount: a forward cone, air and ground targets ahead of the ship.' },
-  dorsal: { label: 'Top deck', short: 'TOP', col: '#7fb6ff', desc: 'Top-deck turret: turns all the way round but cannot depress below the hull, so air targets only.' },
-  broadside: { label: 'Broadside', short: 'SIDE', col: '#f2a541', desc: 'Side mount: fires into its flank in ripple volleys at anything level with the hull, air or ground.' },
-  ventral: { label: 'Ventral', short: 'BELLY', col: '#e88a3c', desc: 'Drops ordnance on the city and ground targets below and around the ship. Ground only.' },
-  omni: { label: 'All-round', short: 'OMNI', col: '#9be7ff', desc: 'Works in every direction around the hull.' },
+  bow: { label: 'Bridge gun', short: 'BOW', col: '#4fd1e8', desc: 'Bridge mount: a narrow cone where it faces (fore, fore-port or fore-starboard), air and ground. Towers ahead of it block it.' },
+  dorsal: { label: 'Top deck', short: 'TOP', col: '#7fb6ff', desc: 'Top-deck turret: a wide 240° arc around its facing, but it cannot depress below the hull, so air targets only. The bridge tower and engine funnels block it.' },
+  broadside: { label: 'Broadside', short: 'SIDE', col: '#f2a541', desc: 'Sponson: a 120° arc outboard on its own side, angled fore, abeam or aft. Air and ground, in ripple volleys. Neighbouring sponsons block it.' },
+  ventral: { label: 'Ventral', short: 'BELLY', col: '#e88a3c', desc: 'Drops ordnance on the city and ground targets below and around the ship. Ground only; facing does not matter.' },
+  omni: { label: 'All-round', short: 'OMNI', col: '#9be7ff', desc: 'Works in every direction around the hull; facing does not matter.' },
   internal: { label: 'Internal', short: 'BAY', col: '#9aa7b4', desc: 'Utility bay inside the hull.' },
 };
 /** The arc a mount position gives, before the weapon in it is considered. */
@@ -145,41 +160,147 @@ export function mountArc(type: SectionType, kind: SlotKind, partId: string | nul
   }
   return positionArc(type, kind);
 }
+/** Does the facing of a mount matter for the part in it? (Not for ventral ordnance, all-round weapons or bays.) */
+export const facingMatters = (arc: Arc) => arc === 'bow' || arc === 'dorsal' || arc === 'broadside';
+
+/* ---------------- facing ---------------- */
+
+/** Facings a weapon mount may take: the bridge gun looks forward, a sponson outboard on its own side, a top-deck turret anywhere. */
+export function allowedFacings(type: SectionType, i: number): Facing[] {
+  if (SECTIONS[type].slots[i] !== 'W') return [];
+  if (type === 'bridge') return [7, 0, 1];
+  if (type === 'battery') return i === 0 ? [7, 6, 5] : i === 2 ? [1, 2, 3] : [7, 6, 5, 1, 2, 3];
+  return [0, 1, 2, 3, 4, 5, 6, 7];
+}
+/** A new mount's facing: sponsons abeam (the centre one to starboard), everything else forward. */
+export const defaultFacing = (type: SectionType, i: number): Facing => (type === 'battery' ? (i === 0 ? 6 : 2) : 0);
+/** The facing of slot i of a section (its stored facing if valid there, else the default). */
+export function mountFacing(s: Section, i: number): Facing {
+  const v = s.face?.[i];
+  return allowedFacings(s.type, i).includes(v as Facing) ? (v as Facing) : defaultFacing(s.type, i);
+}
+/** The next facing a mount would take when rotated clockwise (dir 1) or anticlockwise (-1), or null if it cannot turn. */
+export function nextFacing(s: Section, i: number, dir: 1 | -1): Facing | null {
+  const ok = allowedFacings(s.type, i);
+  if (ok.length < 2) return null;
+  const cur = mountFacing(s, i), sorted = ok.slice().sort((a, b) => a - b);
+  // Walk the compass from the current facing until an allowed one comes up.
+  for (let k = 1; k <= 8; k++) { const f = (((cur + dir * k) % 8) + 8) % 8 as Facing; if (sorted.includes(f)) return f; }
+  return null;
+}
+/** Ship-space angle of a facing (0 = bow, +PI/2 = starboard). */
+export const facingAngle = (f: Facing) => wrapPi((f * Math.PI) / 4);
+
 /** What a mount can engage: 'shots' is point defense (enemy fire), 'none' a utility bay. */
 export type TargetLayers = 'air' | 'ground' | 'both' | 'shots' | 'none';
 /** One traverse sector in SHIP space: radians, 0 = dead ahead (the bow), +PI/2 = starboard, -PI/2 = port. */
 export interface Sector { c: number; h: number }
+/** A bearing range the ship's own hull blocks for a mount, and what blocks it. */
+export interface Blocked extends Sector { by: SectionType }
 export interface Traverse {
   arc: Arc;
-  /** Sectors the mount can train in (empty for utility bays). A full circle is { c: 0, h: PI }. */ sectors: Sector[];
+  /** Sectors the mount can train in (empty for utility bays, or a gun its own hull fully masks). A full circle is { c: 0, h: PI }. */ sectors: Sector[];
   /** What it can engage from here. */ layers: TargetLayers;
   /** Ventral ordnance falls; nothing to train. */ down: boolean;
+  /** Bearings inside its facing's arc that the hull blocks (towers, funnels, neighbouring sponsons). */ blocked: Blocked[];
 }
-/** Traverse half-widths by arc (radians). */
-export const TRAVERSE = { bow: 0.75, broadside: 1.0 } as const;
+/** Traverse half-widths by arc (radians), centred on the mount's facing. */
+export const TRAVERSE = { bow: 0.8, broadside: 1.05, dorsal: 2.1 } as const;
 const FULL: Sector[] = [{ c: 0, h: Math.PI }];
-/**
- * The traverse of a weapon in a mount: sectors in ship space and the layers it can engage. `side` is the broadside
- * side (-1 port, 1 starboard, 0 either). Ghosts and the player share it; the ship renderer clamps turret yaw to it.
- */
-export function mountTraverse(type: SectionType, kind: SlotKind, partId: string | null | undefined, side: -1 | 0 | 1 = 0): Traverse {
-  const arc = mountArc(type, kind, partId), pos = positionArc(type, kind);
-  switch (arc) {
-    case 'internal': return { arc, sectors: [], layers: 'none', down: false };
-    case 'bow': return { arc, sectors: [{ c: 0, h: TRAVERSE.bow }], layers: 'both', down: false };
-    case 'dorsal': return { arc, sectors: FULL, layers: 'air', down: false };
-    case 'broadside': {
-      const h = TRAVERSE.broadside;
-      return { arc, sectors: side ? [{ c: (side * Math.PI) / 2, h }] : [{ c: -Math.PI / 2, h }, { c: Math.PI / 2, h }], layers: 'both', down: false };
+
+/* Sector algebra: sectors as [lo, hi] intervals in ship radians (unwrapped, hi - lo <= 2 PI). */
+type Iv = [number, number];
+const toIv = (s: Sector): Iv => [s.c - s.h, s.c + s.h];
+const toSector = ([lo, hi]: Iv): Sector => ({ c: wrapPi((lo + hi) / 2), h: (hi - lo) / 2 });
+/** Remove `cut` from every interval (trying it at every turn of the circle). Slivers under ~1° are dropped. */
+function subtractIv(ivs: Iv[], cut: Iv): Iv[] {
+  let out = ivs;
+  for (const k of [-2 * Math.PI, 0, 2 * Math.PI]) {
+    const a = cut[0] + k, b = cut[1] + k, next: Iv[] = [];
+    for (const [lo, hi] of out) {
+      if (b <= lo || a >= hi) { next.push([lo, hi]); continue; }
+      if (a > lo) next.push([lo, a]);
+      if (b < hi) next.push([b, hi]);
     }
-    case 'ventral': return { arc, sectors: FULL, layers: 'ground', down: true };
-    case 'omni': return { arc, sectors: FULL, layers: partId === 'pd' ? 'shots' : pos === 'dorsal' ? 'air' : 'both', down: false };
+    out = next;
   }
+  return out.filter(([lo, hi]) => hi - lo > 0.02);
+}
+/** Keep only the half of the compass centred on `c` (a sponson cannot fire through its own hull, a bridge gun aft). */
+const clipHalf = (ivs: Iv[], c: number) => subtractIv(ivs, [c + Math.PI / 2, c + (3 * Math.PI) / 2]);
+
+/**
+ * The traverse of a weapon in a mount facing `facing`, before the rest of the hull is considered (derive() then masks
+ * what towers, funnels and sponsons block: see hullShadows). Ghosts and the player share it; the ship renderer clamps
+ * turret yaw to it.
+ */
+export function mountTraverse(type: SectionType, kind: SlotKind, partId: string | null | undefined, facing: Facing = 0): Traverse {
+  const arc = mountArc(type, kind, partId), pos = positionArc(type, kind), c = facingAngle(facing);
+  const mk = (ivs: Iv[], layers: TargetLayers): Traverse => ({ arc, sectors: ivs.map(toSector), layers, down: false, blocked: [] });
+  switch (arc) {
+    case 'internal': return { arc, sectors: [], layers: 'none', down: false, blocked: [] };
+    case 'bow': return mk(clipHalf([toIv({ c, h: TRAVERSE.bow })], 0), 'both');
+    case 'dorsal': return mk([toIv({ c, h: TRAVERSE.dorsal })], 'air');
+    case 'broadside': return mk(clipHalf([toIv({ c, h: TRAVERSE.broadside })], Math.sign(Math.sin(c)) * Math.PI / 2), 'both');
+    case 'ventral': return { arc, sectors: FULL, layers: 'ground', down: true, blocked: [] };
+    case 'omni': return { arc, sectors: FULL, layers: partId === 'pd' ? 'shots' : pos === 'dorsal' ? 'air' : 'both', down: false, blocked: [] };
+  }
+}
+
+/* ---------------- hull shadows ---------------- */
+
+/** A box on the hull that blocks fire (ship design units, centre and half sizes; y grows toward the stern). */
+export interface Obstacle { x: number; y: number; hw: number; hl: number; by: SectionType; si: number; kind: 'tower' | 'sponson' }
+/**
+ * The tall or wide structures of a hull: the bridge tower and engine funnels rise above the top deck (they block
+ * turrets and the bridge gun), Broadside Battery sponsons stand out from the side (they block the sponsons beside them).
+ */
+export function hullObstacles(rects: Rect[]): Obstacle[] {
+  const out: Obstacle[] = [];
+  rects.forEach((r, si) => {
+    const cy = r.y + r.h / 2;
+    if (r.type === 'bridge') out.push({ x: 0, y: r.y + r.h * 0.6, hw: r.w * 0.36, hl: r.h * 0.22, by: r.type, si, kind: 'tower' });
+    if (r.type === 'engine') out.push({ x: 0, y: r.y + r.h * 0.45, hw: r.w * 0.22, hl: r.h * 0.2, by: r.type, si, kind: 'tower' });
+    if (r.type === 'battery') {
+      const hw = (r.w - HULL_BEAM * SHIP_SCALE) / 2 + 2 * SHIP_SCALE;
+      for (const sd of [-1, 1]) out.push({ x: sd * (r.w / 2 - hw), y: cy, hw, hl: r.h * 0.38, by: r.type, si, kind: 'sponson' });
+    }
+  });
+  return out;
+}
+/** The bearing range (ship space) an obstacle covers as seen from (x, y), or null if the point is inside it. */
+export function shadowOf(x: number, y: number, o: Obstacle): Sector | null {
+  if (Math.abs(x - o.x) <= o.hw && Math.abs(y - o.y) <= o.hl) return null;
+  const bearing = (dx: number, dy: number) => Math.atan2(dx, -dy);
+  const a0 = bearing(o.x - x, o.y - y);
+  let lo = 0, hi = 0;
+  for (const [cx, cy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+    const d = wrapPi(bearing(o.x + cx * o.hw - x, o.y + cy * o.hl - y) - a0);
+    lo = Math.min(lo, d); hi = Math.max(hi, d);
+  }
+  return { c: wrapPi(a0 + (lo + hi) / 2), h: (hi - lo) / 2 };
+}
+/** Mask a mount's traverse by the hull around it: towers block bridge guns and turrets, sponsons block other sponsons. */
+export function hullShadows(t: Traverse, x: number, y: number, si: number, obstacles: Obstacle[]): Traverse {
+  const kind = t.arc === 'broadside' ? 'sponson' : t.arc === 'bow' || t.arc === 'dorsal' ? 'tower' : null;
+  if (!kind) return t;
+  let ivs = t.sectors.map(toIv);
+  const blocked: Blocked[] = [];
+  for (const o of obstacles) {
+    if (o.kind !== kind || o.si === si) continue;
+    if (kind === 'sponson' && Math.sign(o.x) !== Math.sign(x)) continue;
+    const sh = shadowOf(x, y, o);
+    if (!sh) continue;
+    const before = ivs;
+    ivs = subtractIv(ivs, toIv(sh));
+    const lost = before.reduce((n, [lo, hi]) => n + hi - lo, 0) - ivs.reduce((n, [lo, hi]) => n + hi - lo, 0);
+    if (lost > 0.01) blocked.push({ ...sh, by: o.by });
+  }
+  return { ...t, sectors: ivs.map(toSector), blocked };
 }
 /** Field angle of a ship-space angle. The player's bow points up the screen; a ghost's (mirrored: y flipped) down. */
 export const shipToField = (a: number, mirrored = false) => (mirrored ? Math.PI / 2 - a : a - Math.PI / 2);
 export const fieldToShip = (a: number, mirrored = false) => (mirrored ? Math.PI / 2 - a : a + Math.PI / 2);
-const wrapPi = (a: number) => { a = (a + Math.PI) % (Math.PI * 2); if (a < 0) a += Math.PI * 2; return a - Math.PI; };
 /** Is a field-space bearing inside the traverse? */
 export function inTraverse(t: Traverse, fieldAngle: number, mirrored = false) {
   const a = fieldToShip(fieldAngle, mirrored);
@@ -207,24 +328,41 @@ export function placementNote(id: string): string {
   if (!has(WEAPONS, id)) return 'Utility bay.';
   if (id === 'pd') return 'Any weapon mount: shoots down enemy fire all round.';
   if (WEAPONS[id].layer === 'ground') return 'Any weapon mount: drops from the belly, ground only.';
-  if (id === 'tesla') return 'All round. Bow or side: air and ground. Top deck: air only.';
-  return 'Bow (forward cone) or side (flank): air and ground. Top deck: all round, air only.';
+  if (id === 'tesla') return 'All round. Bridge or side: air and ground. Top deck: air only.';
+  return 'Bridge (narrow forward cone) or sponson (120° outboard): air and ground. Top deck: 240° around its facing, air only. Rotate the mount to aim its arc; towers and sponsons block it.';
 }
 export interface Mount {
   ox: number; oy: number; kind: SlotKind; part: Part | null; si: number; i: number;
+  /** Which way the mount points (weapon mounts; 0 for bays). */
+  facing: Facing;
   /** Arc this mount fires in with its current part (see Arc). */
   arc: Arc;
-  /** Broadside side: -1 port (left), 1 starboard (right), 0 either. 0 for other arcs. */
+  /** Broadside side from its facing: -1 port (left), 1 starboard (right). 0 for other arcs. */
   side: -1 | 0 | 1;
-  /** Traverse sectors and target layers (mountTraverse). */
+  /** Traverse sectors and target layers (mountTraverse, masked by hullShadows). */
   trav: Traverse;
 }
 export interface Derived {
   /** Top speed (field units/s), acceleration and braking (units/s²): mass makes all three worse, thrust better. */
   accel: number; brake: number;
   maxHp: number; speed: number; shieldMax: number; shieldRegen: number; regen: number; fireMult: number; magnet: number;
-  scrapMult: number; drones: number; droneTier: number; rects: Rect[]; mounts: Mount[]; len: number; width: number; mass: number; thrust: number;
+  scrapMult: number; drones: number; droneTier: number; rects: Rect[]; mounts: Mount[]; /** What blocks fire on this hull. */ obstacles: Obstacle[]; len: number; width: number; mass: number; thrust: number;
   u: Record<string, number>; mods: Mods;
+}
+
+/**
+ * Where slot i sits in its section, as fractions of the section's beam (x, from the centreline) and length (y, from its
+ * forward edge). The bridge gun stands ahead of the tower; Gun Deck turrets on the centreline, one forward and one aft;
+ * Broadside sponsons port and starboard with a centreline casemate between them.
+ */
+export function slotPos(type: SectionType, i: number): [number, number] {
+  switch (type) {
+    case 'bridge': return [0, 0.2];
+    case 'gundeck': return [0, i ? 0.74 : 0.26];
+    case 'battery': return [(i - 1) * 0.4, 0.5];
+    case 'spine': return [(i ? 1 : -1) * 0.22, 0.5];
+    default: return [0, 0.5];
+  }
 }
 
 export function derive(build: Build, mods: Mods = neutralMods()): Derived {
@@ -235,13 +373,12 @@ export function derive(build: Build, mods: Mods = neutralMods()): Derived {
     const d0 = SECTIONS[s.type], d = { ...d0, w: d0.w * SHIP_SCALE, h: d0.h * SHIP_SCALE };
     hp += d.hp; mass += d.mass; thrust += d.thrust;
     rects.push({ x: -d.w / 2, y, w: d.w, h: d.h, type: s.type });
-    const n = d.slots.length;
     d.slots.forEach((k, i) => {
-      const ox = n === 1 ? 0 : n === 2 ? (i ? 1 : -1) * d.w * 0.27 : (i - 1) * d.w * 0.36;
-      const p = s.slots[i] ?? null;
+      const [fx, fy] = slotPos(s.type, i);
+      const p = s.slots[i] ?? null, facing = k === 'W' ? mountFacing(s, i) : 0;
       const arc = mountArc(s.type, k, p?.id);
-      const side: -1 | 0 | 1 = arc === 'broadside' ? (ox < -1 ? -1 : ox > 1 ? 1 : 0) : 0;
-      mounts.push({ ox, oy: y + d.h / 2, kind: k, part: p, si, i, arc, side, trav: mountTraverse(s.type, k, p?.id, side) });
+      const side: -1 | 0 | 1 = arc === 'broadside' ? (Math.sin(facingAngle(facing)) < 0 ? -1 : 1) : 0;
+      mounts.push({ ox: fx * d.w, oy: y + fy * d.h, kind: k, part: p, si, i, facing, arc, side, trav: mountTraverse(s.type, k, p?.id, facing as Facing) });
       if (p && has(UTILS, p.id)) u[p.id] += p.tier;
     });
     y += d.h; width = Math.max(width, d.w);
@@ -249,6 +386,8 @@ export function derive(build: Build, mods: Mods = neutralMods()): Derived {
   const off = y / 2;
   rects.forEach((r) => (r.y -= off));
   mounts.forEach((m) => (m.oy -= off));
+  const obstacles = hullObstacles(rects);
+  mounts.forEach((m) => (m.trav = hullShadows(m.trav, m.ox, m.oy, m.si, obstacles)));
   hp = (hp + 35 * u.plate + mods.hullAdd) * mods.hullMul;
   const speed = (290 * (1 + thrust * 0.05)) / (1 + mass * 0.075) * (1 + 0.12 * u.thruster) * mods.speedMul;
   // Seconds to reach top speed: a starter hull answers in about a third of a second, a full eight-section
@@ -262,8 +401,14 @@ export function derive(build: Build, mods: Mods = neutralMods()): Derived {
     regen: 1.2 * u.repair + mods.regen, fireMult: (1 + 0.1 * u.reactor) * mods.fireMul,
     magnet: MAGNET.base + MAGNET.perTier * u.magnet + mods.magnetAdd, scrapMult: (1 + 0.1 * u.magnet) * mods.scrapMul,
     drones: u.drones ? droneCount(Math.min(5, u.drones)) : 0, droneTier: Math.min(5, u.drones),
-    rects, mounts, len: y, width, mass, thrust, u, mods,
+    rects, mounts, obstacles, len: y, width, mass, thrust, u, mods,
   };
+}
+
+/** The traverse a part would have in mount (si, i) of a derived hull: its facing, masked by the hull (for previews). */
+export function traverseIn(d: Derived, si: number, i: number, partId: string | null | undefined): Traverse {
+  const m = d.mounts.find((x) => x.si === si && x.i === i)!, type = d.rects[si].type;
+  return hullShadows(mountTraverse(type, m.kind, partId, m.facing), m.ox, m.oy, si, d.obstacles);
 }
 
 /** The Vanguard starter: one bow gun, a broadside pair either side of a ventral bomb bay. Other hulls: data/hulls.ts. */
@@ -275,8 +420,10 @@ export const starterBuild = (): Build => ({
   ],
 });
 
-export type GhostSections = { type: string; slots: ([string, number] | null)[] }[];
-export const buildToGhost = (b: Build): GhostSections => b.sections.map((s) => ({ type: s.type, slots: s.slots.map((p) => (p ? [p.id, p.tier] as [string, number] : null)) }));
+export type GhostSections = { type: string; slots: ([string, number] | null)[]; face?: number[] }[];
+export const buildToGhost = (b: Build): GhostSections => b.sections.map((s) => ({
+  type: s.type, slots: s.slots.map((p) => (p ? [p.id, p.tier] as [string, number] : null)), face: s.slots.map((_, i) => mountFacing(s, i)),
+}));
 export function ghostToBuild(sections: unknown): Build {
   const secs: Section[] = [];
   const arr = Array.isArray(sections) ? sections.slice(0, MAX_SECTIONS) : [];
@@ -290,7 +437,9 @@ export function ghostToBuild(sections: unknown): Build {
       if (!isPart(id) || partSlot(id) !== k) return null;
       return mkPart(id, Math.min(5, Math.max(1, Math.round(Number(v[1]) || 1))));
     });
-    secs.push({ type: s.type as SectionType, slots });
+    const sec: Section = { type: s.type as SectionType, slots };
+    if (Array.isArray(s.face)) sec.face = d.slots.map((_, i) => mountFacing({ ...sec, face: s.face }, i));
+    secs.push(sec);
   }
   if (!secs.some((s) => s.type === 'bridge')) secs.unshift({ type: 'bridge', slots: [mkPart('pulse', 1)] });
   return { sections: secs };

@@ -24,7 +24,7 @@ export interface Traverse {
   game: GameTraverse;
 }
 
-const FREE: GameTraverse = { arc: 'dorsal', sectors: [{ c: 0, h: Math.PI }], layers: 'air', down: false };
+const FREE: GameTraverse = { arc: 'dorsal', sectors: [{ c: 0, h: Math.PI }], layers: 'air', down: false, blocked: [] };
 
 export function mountTraverse(m: Mount, _section?: SectionType): Traverse {
   const id = m.part?.id ?? '', g = m.trav ?? FREE;
