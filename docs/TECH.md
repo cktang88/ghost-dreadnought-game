@@ -132,10 +132,15 @@ loses about ±31° dead ahead, one far aft only a few degrees), so sectors can c
 - `ARC_INFO[arc]` gives `label`, `short`, `col` and `desc` for the UI. `positionArc(sectionType, slotKind)` is the arc a mount position
   gives (bridge bow, gun deck dorsal, battery broadside); `mountArc(sectionType, slotKind, partId)` the effective arc (bombs and mortars
   are always ventral, arc coils and PD omni).
-- Ranges (`ARC_RANGE` in combat.ts): bow 1000 inside its cone (bolts strafe ground targets; bow flak lobs shells at them); dorsal 720
-  all round, air only; broadside reaches 760 sideways for anything within half a hull length + 90 of the ship's y and inside its flank
-  sector, air or ground (ground targets get lobbed shells); mortars 520 around the ship; bomb bays drop under the hull. A battery with
-  nothing in its arc holds fire. Missiles and rails also respect the mount's layers (a top-deck pod only seeks aircraft).
+- Combat honours the masked traverse everywhere (`arcTarget(m, x, y)` in combat.ts returns `{ e, a }`: a target and a field bearing to
+  it inside `m.trav`, or null). A gun only picks targets with a bearing inside its sectors (for a ghost hull, any of its keel, beam or
+  centre points), prefers what lies near its facing (`OFF_FACING`), and every round, fan bolt and missile launch is clamped into the
+  traverse: an aft-angled sponson fires aft, a turret turned astern engages astern, and a bearing the hull blocks is never fired
+  through. With nothing to shoot a broadside round goes out along its facing (`restAngle`). Muzzles are the mount's real `ox, oy`
+  along the keel; rails start there. `blockedAt(trav, a)` tells a blocked bearing from one outside the arc.
+- Ranges are data (`RANGE` / `Mount.range` in parts.ts; `ARC_RANGE` in combat.ts is the same table): bow 1000, dorsal 720 (air only),
+  broadside 760 (ground targets get lobbed shells; bow flak lobs them too), mortars 640 and coils 240 from the mount, point defense 200,
+  bomb bays under the hull. A gun with nothing in its arc holds fire. Missiles and rails also respect the mount's layers.
 - Broadside cadence (`BROADSIDE`): each side fires one ripple volley about every 1.7 s, stern to bow, 35 ms between rounds; each gun packs
   `broadsideRounds(part)` rounds (period / cooldown, max 12) at 1.2x damage, +10% per extra gun on the side.
 - Enemy weapons have `range` (`EN[type].range`, measured to the hull by `hullDist`). Out-ranging them is the positional game.
@@ -153,7 +158,8 @@ loses about ±31° dead ahead, one far aft only a few degrees), so sectors can c
   ordnance hits the ground under that pixel). `fire` = left button (the selected group), `salvo` = right button (every group).
   `selectGroup(i)`, `cycleGroup(d)`, `firingGroups()`. Each frame `updateAim` sets `hover` (target under the reticle), the missile `lock`
   (target nearest the reticle within `MANUAL.lockR` 170, while a missile group is selected or salvoing) and per heavy mount
-  `why[uid]` = `heavyWhy(m, x, y, target)`: `''` (bears), `'arc'` (outside its traverse), `'range'` (ground ordnance beyond `reach`:
+  `why[uid]` = `heavyWhy(m, x, y, target)`: `''` (bears), `'arc'` (outside its facing's arc), `'blocked'` (inside it, but the ship's
+  own hull masks the bearing: `m.trav.blocked`), `'range'` (ground ordnance beyond `reach`:
   bombs 420, mortars 640 from the mount), `'air'` (a top-deck gun and the target is on the ground), `'ground'`. `bears[uid]` is `why === ''`.
 - Manual fire (`fireHeavy`): a loaded heavy gun whose group is pulled and that bears fires at `MANUAL.dmgMul` (1.1x, in place of the
   broadside ripple's 1.2x): rails along the line to the reticle (clamped to the traverse), missile pairs on the lock (or to the point,
@@ -164,12 +170,14 @@ loses about ±31° dead ahead, one far aft only a few degrees), so sectors can c
   select, `Q` / `E` and the wheel cycle (`uiSwitch`, or `uiError` when there is no such group); the system cursor hides over the field.
   Touch: drag steers, every gun aims itself. Space stays Overdrive. Hold Shift (or T to latch) for the FLIR thermal view.
 - HUD (`src/render/hud.ts`): bottom-left weapon panel with a numbered slot per heavy group (keycap, icon, AIR/GND/ALL tag, a reload pip
-  per mount, dimmed when it cannot bear, READY / n/m BEAR / NO BEARING) and an AUTO lamp bank; the reticle (brackets, reload ring per
-  mount, group tag, a slash and OUT OF ARC / OUT OF REACH / AIR ONLY when nothing bears, a dashed impact ring for ground ordnance and
-  the reach circles when out of reach, dashed firing lines from rails that bear and the traverse wedge of those that do not, closing lock
-  brackets for missiles, and a HOLD LMB prompt until the first heavy shot).
-- Ghost bosses keep their own fire control (`bossFire`, ghost broadsides) but train every gun inside its mount's traverse (mirrored):
-  the bridge gun in its cone, top-deck turrets all round (the player is an aircraft), broadsides in their flank sector.
+  per mount, dimmed when it cannot bear, READY / n/m BEAR / NO BEARING / BLOCKED) and an AUTO lamp bank; the reticle (brackets, reload
+  ring per mount, group tag, a slash and OUT OF ARC / BLOCKED / OUT OF REACH / AIR ONLY when nothing bears, a dashed impact ring for
+  ground ordnance and the reach circles when out of reach, dashed firing lines from rails that bear and, for those that do not, every
+  open sector of their masked traverse as a wedge drawn through the camera with the hull-blocked bearings in hostile red, closing lock
+  brackets for missiles, and a HOLD LMB prompt until the first heavy shot). Rear entries holding off the bottom edge show a pulsing
+  ASTERN double chevron with a fill bar (`asternWarnings`), one per group.
+- Ghost bosses keep their own fire control (`bossFire`, ghost broadsides) but train every gun inside its mount's recorded facing and
+  masked traverse (mirrored), and an aimed gun with no bearing on the player's hull holds fire (see "Ghost bosses").
 
 ### Events (`S.events`, `S.eventId`)
 Sim to audio/VFX/UI queue, capped at 160. Each `GameEvent` has an increasing `id`; consumers remember the last id they handled
@@ -178,7 +186,8 @@ Sim to audio/VFX/UI queue, capped at 160. Each `GameEvent` has an increasing `id
 `structure` (`n` scrap it paid), `carnageTier` (`n` new whole multiplier), `playerHit` (`n` damage).
 
 ### Overdrive (`S.overdrive`)
-`{ charge 0..1, active, kind, t (seconds left), dur, beam, trail, allies, radius }`. Space (`keys.od = true`, or `triggerOverdrive()`)
+`{ charge 0..1, active, kind, t (seconds left), dur, beam, extra, off, pulseT, ticks, trail, allies, radius }`. `extra[]` are upgrade
+beams drawn like `beam` (Twin Lances, a Spear Fan). Every number below is before the upgrade tree (`S.odm`, see "Overdrive upgrade tree"). Space (`keys.od = true`, or `triggerOverdrive()`)
 fires it when `charge >= 1`. Charge comes from kills (elites 0.5), structures and damage to a ghost. While active every battery fires 1.5x faster.
 Kinds (`OVERDRIVES` in `src/data/hulls.ts`):
 - `lance` Ventral Lance (Vanguard, 3.6 s): `beam = { x1, y1, x2, y2, w: 38, ground: true, col }` where (x1, y1) is the keel on the flight
@@ -193,6 +202,35 @@ Kinds (`OVERDRIVES` in `src/data/hulls.ts`):
 - `spear` Lance Spear (Lance, 2.6 s): `beam = { x1, y1 (bow), x2: x1, y2: -60, w: 54, ground: false }` on the flight plane. Deletes enemy shots in it.
 - `wing` Strike Wing (Leviathan, 7 s): `allies[]` = `{ x, y, vx, vy, hdg, cd, tg, t }`, eight strike craft on the flight plane. Their shots are normal `S.pb` bolts.
 - `bulwark` Bulwark Aegis (Bastion, 5 s): a 460-radius shockwave on activation, then `radius` > 0: an aegis around the hull that eats enemy shots; damage taken halved.
+
+### Overdrive upgrade tree (`src/data/overdriveTree.ts`, run.ts `takeOd`, `src/ui/screens/odTree.ts`)
+Every Overdrive refits along branching paths. Three tiers: tier 1 picks a **path** (2-3 nodes; taking one locks the others), tier 2
+offers two refits on that path (one locks the other), tier 3 is the path's capstone. Every tier-2/3 node `requires` its path's tier-1
+node; `odState(id, taken)` gives `taken | open | locked | later`, `openOdNodes`, `canTakeOd`, `sanitizeOd` (untrusted lists).
+Nodes carry typed effects (`OdFx`); `odMods(kind, taken)` folds them into `OdMods` = `{ dur, dmg, width, count, charge, mend, taken,
+follow, air, furrow, twin, skyburn, bombs, intercept, hold, sweep, finale, reflect, pulse, vacuum }`, which `startCombat` stores as
+`S.odm` (from `CombatSetup.odTree`). Combat reads only those fields:
+- Lance: **Sweep** (wider, `follow`: the ground point walks to the reticle, or the nearest ground target, `OD_SWEEP` 300 reach at
+  380/s; `beam.x2, y2` is that point) → Broad Swath / Burning Furrow (the trail keeps burning ground units) → Twin Lances (two more
+  beams `OD_TWIN.gap` either side, 60% damage). **Pierce** (narrower, 30% longer, burns aircraft within `OD_PIERCE` of the column) →
+  Hot Core / Long Burn → Skyburner (double air damage, enemy fire dies in the column).
+- Wing: **Swarm** (+4 craft) → Tight Formation / Long Patrol → Wolfpack (+4). **Heavy Bombers** (4 slower craft, `bomber: true`,
+  bomb ground targets first: S.pb `bomb` bolts, aoe 60·width) → Cluster Bombs / Second Sortie → Heavy Payload. **Interceptors** (the
+  craft hold a screen round the hull and shoot down enemy fire within 90·width, with S.beams tracer lines) → Wide Screen / Aces →
+  Quick Turnaround (charge ×1.4).
+- Spear: **Spear Fan** (1 + count beams `OD_FAN.step` 0.3 rad apart, in `beam` + `extra`, hits by segment distance) → Fivefold / Broad
+  Heads → Scythe (the fan sweeps ±0.35 rad). **Charge and Hold** (width swells 0.6 → 2.0 over the run, +30%) → Focus / Sustain → Nova
+  (as it ends the column detonates every 90 units).
+- Bulwark: **Reflect** (eaten shots come back as our bolts, `OD_REFLECT`) → Mirror / Wide Aegis → Riposte. **Long Watch** (×1.6 time,
+  40% damage taken) → Ironclad (30%) / Pulse (a 300-radius shockwave every 1.5 s, `OD_PULSE`) → Citadel. **Mend** (2.5% max hull/s,
+  times heat healing) → Damage Crews / Salvage Field (a vacuum on every scrap drop) → Phoenix.
+
+Earning picks (Spire-like): every sector boss banks a free **commission** (`run.odCredits`); the tree opens right after the trophy
+(Continue banks it) and from the map's Overdrive button, where only commissions can be spent. Scrap buys refits at a **drydock** (its
+one job: `OD_COST` 90 / 150 / 240 by tier) and at a **merchant** (times its price multiplier, any number). `takeOd(run, id, priceMul)`
+spends a commission first. Picks are per run (`run.od`, in order); ghosts do not record them (a ghost has no Overdrive).
+`tests/unit/overdriveTree.test.ts` holds the tree's shape and rules, the save migration, and that every node measurably changes a
+fixed proving-ground fight (`tests/sim/odScenario.ts`).
 
 ### Carnage (`S.carnage`) and scrap
 `{ value, mult 1..3, since, peak }` (`src/game/feel.ts`, `CARNAGE`). Kills and structures add value; after a 1.6 s grace it decays at
@@ -290,21 +328,35 @@ fields still answer for the ground). None allocates except `terrainAt` without `
 ### Enemies
 Besides `x, y, r, hp, maxHp, layer, type`: `hdg` heading (aircraft), `ang` turret aim, `tele` 0..1 wind-up before a shot (draw a growing hostile glint),
 `vx`. Enemy shots in `S.eb` carry `src` (who fired). Kinds unchanged: `bullet`, `orb`, `mine`, `missile`, `beam` (warn then fire), `strike` (growing ring).
+- **Threats from astern** (`AFT` in combat.ts): a share of director groups come up from behind the ship, so facings matter: interceptors
+  overtake up one side of the hull (`overtake`, one snap shot as they draw level with the stern), drone columns climb the field
+  (`dir: -1`), helicopters and gunships take station off an aft quarter (`quarter: side`, `quarterPoint`), and the ace holds an aft
+  quarter on 12% of its stations in sector 1, 28% from sector 3. Shares (jet 22%, drones 30%, helis 32%, gunships 38%) ramp in with
+  the level (`aftRamp`: ×0.35 in the first fights, full from level 3.5). A rear entry (`aft: true`) first holds off the bottom edge
+  (`AFT.y`, below the camera) for `AFT.warn` (1.3 s, `e.warnT` counts down; it neither moves nor fires nor is targeted), under the HUD's
+  ASTERN chevron. `spawnGroup(type, true)` forces rear entries. Ground units the ship has passed over keep firing aft while in range.
+- Elite hull by sector: `eliteSectorHp` (0.7 + 0.3 per sector, but 1.15 in sector 2). The carrier launches drones every 4.6 s and
+  fans every 3.3 s.
 
 ### Ghost bosses (`S.boss`, boss section of combat.ts)
 A ghost flies its recorded build (`ghostToBuild`), mirrored: its bow points down the screen, so a mount at design offset
 (ox, oy) sits at field (x + ox·s, y − oy·s). Every `BossGun` keeps its mount's `arc` and `side`:
-- non-broadside guns fire on their own cooldowns (`BOSS_CD`), aimed with `clampTraverse(gun.trav, ..., true)`: the bridge gun inside its
-  forward cone (straight down the screen), top-deck turrets all round;
+- every gun keeps its recorded facing and ring (`BossGun.facing`, masked `trav`) and fires only along a bearing on the player's hull
+  inside it (`bossGunBears`, using the keel, beam and centre points of our hull): **a ghost's blind arcs are safe water**. Bridge and
+  top-deck guns hold fire (stay loaded) while the player is outside their arcs; bridge and turret rails aim along their bearing
+  (`eb` beam with `x2, y2`). Muzzles sit on the real mounts along the keel (`bossGunPos`). Ghosts are drawn at most 440 long
+  (`s = min(1.6, 440 / len, 700 / width)`, `homeY = len·s/2 + 60`) so a long player hull keeps sea room beside and under them;
 - every ghost round is scaled by `bossHitEase()` = 2.6 / SHIP_SCALE (×0.85 more from sector 3): the scale pass made our hull a
   bigger target. Scripted pilot hull lost per boss: s1 32% / s2 60% / s3 70%;
 - ventral (bombs: mines; mortars: telegraphed strikes) and omni (arc coil rings, point defense) as before;
-- broadside lanes lock inside the flank sector (±`TRAVERSE.broadside` about the beam), and a flank engages when the player is inside it;
+- broadside lanes lock on each sponson's bearing to the player (`bossLock`), and a flank engages when at least one of its sponsons
+  bears (`bossFiring`; phase 3 fires every sponson, blind ones along the nearest edge of their arc). Rakes, weaves and the slow second
+  layer are clamped into each sponson's arc; slipping into its blind arc during the wind-up spoils the volley;
 - broadside guns fire **volleys** per flank (`B.volley[0]` port / screen left, `[1]` starboard): a flank whose arc holds the
   player winds up for `BOSS_BROADSIDE.tele[phase]` s (the FX layer draws `B.glints`: a hostile glint per gun and its lane,
   or the arc it will rake), then ripples stern to bow, `stagger` 75 ms per round. Rounds per gun `bossRounds(part, phase)`.
   Pulse fires twin-barrel pairs, scatter a 3-fan, flak an orb that bursts into 6, seekers a pair, rail a telegraphed beam
-  across the field (`eb` beam with `x2, y2`). Centre (either-side) guns join the flank the player is on.
+  across the field (`eb` beam with `x2, y2`). Every sponson has a side from its facing (the centre mount too).
 - Phases by hull (`BOSS_PHASES` 66% / 33%, notches on the HUD bar): 1 **lanes** (each gun's rounds on one locked line;
   the ghost sweeps the field), 2 **rake** (rounds sweep ±0.45 rad across the locked line with a 0.34 rad hole; the ghost
   comes about to hold the player on its beam, at about 85 units/s), 3 **full broadside** (both flanks every volley,
@@ -314,7 +366,10 @@ A ghost flies its recorded build (`ghostToBuild`), mirrored: its bow points down
   about to bring its broadsides to bear also takes ours, and early builds are broadside-heavy. Hull damage from its
   broadsides is tallied as `boss:broadside` in `S.stats.dmgBy` (rails `boss:broadside:rail`), bow, ventral and omni as `boss`.
 - Defense cores (`aiGhost`, no player ghost available) always carry a Broadside Battery behind the bridge, a second
-  from sector 3, with broadside-capable guns on its flanks.
+  from sector 3, with broadside-capable guns on its flanks, and deliberate facings (`AI_FACE`) and rings (`AI_RING`): sector 1 has
+  sponsons angled aft and turrets astern, so off its bow quarters (about 35-90° off its bow) nothing bears; sector 2 sponsons abeam,
+  one turret forward and one astern on wide rings; sector 3+ the fore battery angled forward, wide rings everywhere, full turret
+  rings from sector 4. Client ghost validation (`validGhost`) keeps recorded `face`, `ring` and `at`.
 
 ### Scrap economy (`tests/sim/economy.ts`, `tests/unit/economy.test.ts`)
 `BALANCE=1 npx vitest run tests/unit/economy.test.ts --disable-console-intercept` prints, per sector, the mean scrap of
@@ -355,9 +410,11 @@ picked up in combat, by 0.7; `tests/unit/repair.test.ts` holds the heat descript
 `kills, airKills, groundKills, elites, structures, broadsides, maxVolley, overdrives, lanceStructures, dmgTaken, dmgDealt, dmgToTarget,
 peakCarnage, scrapRaw, dmgBy{src: dmg}`. `S.seen` = kills per enemy type this fight (codex). main.ts folds them into `run.stats` / `run.seen`.
 
-### Run (`src/game/run.ts`, save v3)
-`RunState` adds `hull`, `heat`, `daily` (date key or null), `won`, `endless`, `phase: 'map' | 'victory'`, `odStart`, `seen`, and the wider
-`RunStats`. Saved under `gd.run.v3`; a `gd.run.v2` save migrates (`migrateRunSave`) to the Vanguard at heat 0. `CAMPAIGN_SECTORS = 3`:
+### Run (`src/game/run.ts`, save v4)
+`RunState` adds `hull`, `heat`, `daily` (date key or null), `won`, `endless`, `phase: 'map' | 'victory'`, `odStart`, `seen`, the wider
+`RunStats`, and the Overdrive tree: `od` (node ids, sanitized on load and filtered to the hull's Overdrive) and `odCredits` (banked
+commissions, 0..9). Saved under `gd.run.v4`; `migrateRunSave` steps v2 (to the Vanguard at heat 0) → v3 → v4 (no picks, one commission
+per boss already beaten); old `gd.run.v3` / `gd.run.v2` keys are still read. `CAMPAIGN_SECTORS = 3`:
 clearing sector 3 shows the victory screen; the pilot banks the run or pushes on into endless sectors.
 
 ### Profile and the fleet loop (`src/game/meta.ts`, `src/data/goals.ts`, `src/data/hulls.ts`, `src/data/heat.ts`)
@@ -388,7 +445,9 @@ clearing sector 3 shows the victory screen; the pilot banks the run or pushes on
 ### Balance harness
 `tests/sim/harness.ts` runs real fights headless with a scripted pilot and seeded `Math.random`. Bots: `pilot` (every gun aims
 itself), `gunner` (same flying, `gunnery.manual` on, the reticle on the boss / elite or the nearest target and every heavy group
-salvoing: what a mouse player does) and `idle`. A unit test holds the gunner's DPS within 0.85-1.6x of the pilot's. `BALANCE=1 npx vitest run
+salvoing: what a mouse player does) and `idle`. A unit test holds the gunner's mean DPS over four seeds within 0.85-1.6x of the
+pilot's (one fight swings about a quarter either way with threats from every bearing). The `s1end`, `mid` and `late` builds face their
+mounts and carry wide rings as a mid-run pilot would. `BALANCE=1 npx vitest run
 tests/unit/balance.test.ts --disable-console-intercept` prints the table (`ONLY=s2-boss,ace` narrows it).
 
 ### Debug hooks (`window.__gd`)

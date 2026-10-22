@@ -141,7 +141,7 @@ test('refit board: drag to equip, swap mounts, unmount, reorder sections, keyboa
   // Modules: nudge the engine block to starboard; it joins the hull at the next legal grid spot.
   await page.click('li.sec[data-sec="2"] button[aria-label="Move Engine Block to starboard"]');
   expect(await gd<number>(page, 'g.run.build.sections[2].at[0]')).toBeGreaterThan(0);
-  expect(await page.evaluate(() => localStorage.getItem('gd.run.v3') ?? '')).toContain('"at"');
+  expect(await page.evaluate(() => localStorage.getItem('gd.run.v4') ?? '')).toContain('"at"');
   await page.screenshot({ path: `${SHOTS}/17-refit-after.png` });
   await page.click('#btn-done');
   await expect(page.locator('svg[aria-label^="Sector"]')).toBeVisible();
