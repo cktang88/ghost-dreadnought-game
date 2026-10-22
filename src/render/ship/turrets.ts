@@ -234,12 +234,29 @@ function barbette(c: Ctx2, x: number, z: number, r: number, y0: number, y1: numb
   for (let k = 0; k < 6; k++) { const a = (k / 6) * Math.PI * 2 + 0.3; c.lights.add(x + Math.cos(a) * r * 1.02, y1 - 0.15, z + Math.sin(a) * r * 1.02, c.L.light.edge, 0.9, 0.22, LMode.Steady); }
 }
 
+/**
+ * Turret ring upgrades read on the model: a wide ring (2) seats the gun in a broader armoured collar with a hazard
+ * band, a full ring (3) adds a second, stepped collar ringed with lamps.
+ */
+function ringCollar(c: Ctx2, x: number, z: number, r: number, y: number, ring: number) {
+  const P0 = c.L.paint;
+  for (let k = 1; k < ring; k++) {
+    // Each level a broader, lower step: a hazard-banded annulus that reads from above, on an armoured skirt.
+    const rr = r * (1 + 0.24 * k), yt = y - 0.35 * (k - 1) - 0.1, m = T(x, 0, z);
+    lathe(c.hb, B.ribs, [[rr, yt - 1.4], [rr, yt]], 16, P0.hull.clone().multiplyScalar(0.75), m, false, 6);
+    lathe(c.hb, B.hazard, [[rr, yt + 0.02], [rr * 0.84, yt + 0.02]], 16, P0.accent.clone().multiplyScalar(0.8), m, false, 10);
+    if (k === 2) for (let i = 0; i < 12; i++) { const a = (i / 12) * Math.PI * 2; c.lights.add(x + Math.cos(a) * rr * 1.03, yt - 0.6, z + Math.sin(a) * rr * 1.03, c.L.light.edge, 1.1, 0.26, LMode.Steady); }
+  }
+}
+
 export interface MountSpec {
   uid: number; id: string; tier: number; x: number; z: number; deck: number; trav: Traverse;
   /** Hull geometry at the mount: half width at the deck edge, the outboard gallery height, terrace edge. */
   hw: number; terrace: number; gallery: number;
   /** Barbette height above the deck (superfiring turrets stand higher). */
   lift?: number;
+  /** Turret ring level 1..3 (ringCollar). */
+  ring?: number;
   /** Broadside sponson the hull built under this mount: its outboard face (|x|) and roof height. */
   sponson?: { outer: number; top: number; z0: number; z1: number };
 }
@@ -303,7 +320,8 @@ export function buildMount(s: MountSpec, rig: GunRig, hb: Buckets, L: Livery, li
       lights.row([s.x - R * 0.9, yb - 2.2, s.z + R * 1.14], [s.x + R * 0.9, yb - 2.2, s.z + R * 1.14], 0.7, LL.window, 0.9, 0.22, 0.7, LMode.Steady);
       hb.get('shadow').quad([s.x - R + 2, s.deck + 0.07, s.z - R + 1.5], [s.x + R * 1.6, s.deck + 0.07, s.z - R + 1.5], [s.x + R * 1.6, s.deck + 0.07, s.z + R * 1.8], [s.x - R + 2, s.deck + 0.07, s.z + R * 1.8], [0, 0], [1, 0], [1, 1], [0, 1], P0.hull, [0, 1, 0]);
     }
-    barbette(c2, s.x, s.z, R * 1.02, yb - 1.2, yb);
+    barbette(c2, s.x, s.z, R * (1.02 + 0.06 * ((s.ring ?? 1) - 1)), yb - 1.2, yb);
+    ringCollar(c2, s.x, s.z, R * 1.05, yb - 1.2, s.ring ?? 1);
     const g = rig.add(s.x, yb, s.z, 1);
     if (g) {
       capital(p, g, id, nb, R, trav.elev * (id === 'flak' ? 1.4 : 0.6), tier, () => rig.bk.tag([g.idx, 0]), () => rig.bk.tag([g.idx, 1]));
@@ -322,6 +340,7 @@ export function buildMount(s: MountSpec, rig: GunRig, hb: Buckets, L: Livery, li
     for (let i = 0; i < nn; i++) {
       const gz = za + i * sp;
       lathe(hb, B.ribs, [[1.2 * g2, 0], [1.2 * g2, 0.22], [1.0 * g2, 0.3]], 10, P0.dark, T(x, y, gz));
+      ringCollar(c2, x, gz, 1.2 * g2, y + 0.2, s.ring ?? 1);
       const g = rig.add(x, y + 0.25, gz, g2); if (!g || !design) continue;
       design(p, g, trav.elev, false, tier, () => rig.bk.tag([g.idx, 0]), () => rig.bk.tag([g.idx, 1]));
       rig.bk.tag(null); t.guns.push(g);
@@ -378,6 +397,7 @@ export function buildMount(s: MountSpec, rig: GunRig, hb: Buckets, L: Livery, li
     for (const [px, pz, up] of pos) {
       const yb = s.deck + 0.35 + (0.45 + up * 0.9) * gs;
       barbette(c2, px, pz, r, s.deck + 0.35, yb);
+      ringCollar(c2, px, pz, r, yb, s.ring ?? 1);
       place(px, yb, pz, false);
     }
     if (id === 'missile') {

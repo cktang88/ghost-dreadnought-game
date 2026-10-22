@@ -1,5 +1,5 @@
 // Dev tool: the ship layer on its own, through the real engine (lighting, bloom, tone map) with a
-// zoomable camera. /tools/ship.html?build=starter|big|mid|max&zoom=0.35&ghost=0|1&hp=1&phase=1..3&fire=1&t=4
+// zoomable camera. /tools/ship.html?build=starter|big|mid|hammer|outrig|max&zoom=0.35&ghost=0|1&hp=1&phase=1..3&fire=1&t=4
 import { Engine } from '../engine';
 import { ShipLayer } from './shipLayer';
 import { preloadKits } from '../assets';
@@ -10,15 +10,21 @@ import type { Ghost } from '../../game/ghosts';
 import * as THREE from 'three';
 
 const q = new URLSearchParams(location.search);
-// Sections are [type, slots, facings?]; `mid` puts the bridge amidships.
-const BUILDS: Record<string, [string, (string | null)[], number[]?][]> = {
+// Sections are [type, slots, facings?, at?, rings?]; `mid` puts the bridge amidships, `hammer` and `outrig` lay modules
+// side by side on the grid (Section.at, design units: [centre x, forward y]).
+type Spec = [string, (string | null)[], (number[] | null)?, [number, number]?, number[]?];
+const BUILDS: Record<string, Spec[]> = {
   starter: [['bridge', ['pulse']], ['gundeck', ['pulse', 'bomb']], ['engine', [null]]],
   big: [['bridge', ['pulse']], ['gundeck', ['flak', 'missile']], ['battery', ['spread', 'rail', 'tesla']], ['armor', ['plate']], ['spine', ['shield', 'drones']], ['engine', ['thruster']]],
   mid: [['gundeck', ['pulse', 'flak'], [0, 0]], ['battery', ['spread', 'pulse', 'missile']], ['bridge', ['rail']], ['gundeck', ['flak', 'pulse'], [4, 4]], ['engine', ['thruster']]],
+  hammer: [['gundeck', ['pulse', 'flak'], [0, 0], [0, 0], [3, 2]], ['battery', ['spread', 'pulse', null], [7, 6, 2], [-26, 0]], ['battery', [null, 'flak', 'spread'], [6, 2, 1], [26, 0], [1, 2, 3]],
+    ['bridge', ['rail'], null, [0, 26]], ['spine', ['shield', 'drones'], null, [0, 56]], ['engine', ['thruster'], null, [0, 74]]],
+  outrig: [['bridge', ['pulse'], null, [0, 0]], ['gundeck', ['flak', 'missile'], [0, 4], [0, 30], [2, 1]], ['battery', ['pulse', 'rail', null], [6, 6, 2], [-26, 30], [2, 1, 1]],
+    ['battery', [null, 'rail', 'pulse'], [6, 2, 2], [26, 30], [1, 1, 3]], ['armor', ['plate'], null, [0, 56]], ['engine', ['repair'], null, [0, 74]]],
   max: [['bridge', ['rail']], ['gundeck', ['pulse', 'flak']], ['battery', ['spread', 'artillery', 'missile']], ['battery', ['tesla', 'pd', 'bomb']], ['armor', ['reactor']], ['spine', ['shield', 'magnet']], ['gundeck', ['pulse', 'artillery']], ['engine', ['repair']]],
 };
 const spec = BUILDS[q.get('build') || 'starter'] ?? JSON.parse(q.get('build')!);
-const build: Build = ghostToBuild(spec.map(([type, slots, face]) => ({ type, face, slots: slots.map((id) => (id ? [id, Number(q.get('tier') || 3)] : null)) })));
+const build: Build = ghostToBuild(spec.map(([type, slots, face, at, ring]) => ({ type, face: face ?? undefined, at, ring, slots: slots.map((id) => (id ? [id, Number(q.get('tier') || 3)] : null)) })));
 const ghost = q.get('ghost') === '1', zoom = Number(q.get('zoom') || 0.4), hp = Number(q.get('hp') || 1), fire = q.get('fire') !== '0';
 const canvas = document.createElement('canvas'); document.body.append(canvas);
 document.body.style.cssText = 'margin:0;background:#000;overflow:hidden';

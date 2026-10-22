@@ -44,6 +44,8 @@ interface Ctx extends UCtx {
   rnd: Rng;
   dmg: V3[]; vents: V3[]; spin: Spinner[]; nozzles: Nozzle[]; root: THREE.Group; turrets: Turret[];
   edgeSegs: THREE.BufferGeometry[]; sig: number;
+  /** Is another module welded to this hull's port (-1) or starboard (1) side at z? (Then that side is no outer hull.) */
+  nb: (sd: number, z: number) => boolean;
 }
 
 /* ---------------- helpers ---------------- */
@@ -169,17 +171,24 @@ function kit(c: Ctx, name: string, x: number, y: number, z: number, yaw = 0, s =
  * toward an end they are (`f`: 0 amidships, 1 at the stem or the transom), which lifts the keel and pulls
  * the lower hull in under the flared deck.
  */
-const HULL_HW: Record<string, number> = { bridge: 0.94, gundeck: 1, battery: 1, armor: 1.06, spine: 0.9, engine: 0.97 };
 interface Station { z: number; hw: number; f: number; bow?: boolean }
 /** Half beam of the hull proper (body units). */
 const HHW = (HULL_BEAM * REF_SCALE) / 2;
 /** Clipper prow length ahead of the first section, and how far into it the entry runs. */
 export const prowLen = (hw: number) => hw * 1.45;
-function stations(rects: HullRect[]): Station[] {
-  const st: Station[] = [], hws = rects.map((r) => HHW * (HULL_HW[r.type] ?? 1));
-  const r0 = rects[0], zA = r0.y, P = prowLen(hws[0]), S = Math.min(r0.h * 0.24, 18), L = P + S;
+/** Hull half beam of a module: its own beam (a battery's without the sponsons). */
+const moduleHw = (r: HullRect) => (r.type === 'battery' ? HHW : r.w / 2);
+/**
+ * Stations of one hull run (modules stacked fore and aft on one keel line, run-local x). `prow`: nothing ahead of
+ * the run, so it gets a clipper bow; `stern`: nothing astern, so a rounded transom. Otherwise the run ends square
+ * against the module it is welded to.
+ */
+function stations(rects: HullRect[], prow = true, stern = true): Station[] {
+  const st: Station[] = [], hws = rects.map(moduleHw);
+  const r0 = rects[0], zA = r0.y, len = rects.reduce((n, r) => n + r.h, 0), P = Math.min(prowLen(hws[0]), len * 0.42), S = Math.min(r0.h * 0.24, 18), L = P + S;
   // Clipper prow: a hollow, knife-fine entry that swells into the shoulders.
-  for (let k = 0; k <= 10; k++) { const t = k / 10; st.push({ z: zA - P + L * t, hw: Math.max(0.3, hws[0] * Math.pow(1 - Math.pow(1 - t, 2.2), 1.5)), f: Math.pow(1 - t, 1.4), bow: true }); }
+  if (prow) for (let k = 0; k <= 10; k++) { const t = k / 10; st.push({ z: zA - P + L * t, hw: Math.max(0.3, hws[0] * Math.pow(1 - Math.pow(1 - t, 2.2), 1.5)), f: Math.pow(1 - t, 1.4), bow: true }); }
+  else st.push({ z: zA, hw: hws[0], f: 0 });
   // Section to section: long smooth fairings, never a step.
   rects.forEach((r, i) => {
     if (!i || Math.abs(hws[i] - hws[i - 1]) < 0.05) return;
@@ -188,7 +197,8 @@ function stations(rects: HullRect[]): Station[] {
   });
   // Rounded stern: the quarters tuck in to a transom a little past the last section.
   const rl = rects[rects.length - 1], zB = rl.y + rl.h, hl = hws[hws.length - 1], SL = hl * 0.5;
-  for (let k = 0; k <= 6; k++) { const t = k / 6; st.push({ z: zB - 6 + (SL + 6) * t, hw: hl * Math.sqrt(1 - Math.pow(t * 0.82, 2)), f: Math.pow(t, 1.6) * 0.6 }); }
+  if (stern) for (let k = 0; k <= 6; k++) { const t = k / 6; st.push({ z: zB - 6 + (SL + 6) * t, hw: hl * Math.sqrt(1 - Math.pow(t * 0.82, 2)), f: Math.pow(t, 1.6) * 0.6 }); }
+  else st.push({ z: zB, hw: hl, f: 0 });
   st.sort((a, b) => a.z - b.z);
   // Monotonic guard (fairings can meet the prow or stern runs).
   const out: Station[] = [];
@@ -220,7 +230,7 @@ function profile(s: Station): V2[] {
 const PROFILE_BANDS: Band[] = [B.lightbar, B.grille, B.ribs, B.panels, B.brackets, B.panels, B.ribs, B.darkPanel, B.darkPanel, B.darkPanel];
 const PROFILE_SHADE = [1.0, 0.8, 1.0, 1.0, 1.25, 1.05, 0.75, 0.55, 0.45, 0.4];
 
-function hull(c: Ctx, st: Station[]) {
+function hull(c: Ctx, st: Station[], stern = true) {
   const P = c.L.paint, LL = c.L.light;
   for (let i = 0; i < st.length - 1; i++) {
     const a = st[i], b = st[i + 1], pa = profile(a), pb = profile(b);
@@ -262,9 +272,9 @@ function hull(c: Ctx, st: Station[]) {
   cap(st[0], -1); cap(st[st.length - 1], 1);
   // Stern: rows of cabin lights across the transom, and a hazard band at the deck edge.
   const s = st[st.length - 1];
-  for (const [yy, f] of [[DECK - 1.2, 0.7], [DECK - 4, 0.75], [DECK - 4.9, 0.6], [DECK - 5.8, 0.6], [DECK - 6.7, 0.5]]) c.lights.row([-s.hw + 2.5, yy, s.z + 0.3], [s.hw - 2.5, yy, s.z + 0.3], 0.5, LL.window, 0.95, 0.2, f, LMode.Steady, c.rnd);
+  if (stern) for (const [yy, f] of [[DECK - 1.2, 0.7], [DECK - 4, 0.75], [DECK - 4.9, 0.6], [DECK - 5.8, 0.6], [DECK - 6.7, 0.5]]) c.lights.row([-s.hw + 2.5, yy, s.z + 0.3], [s.hw - 2.5, yy, s.z + 0.3], 0.5, LL.window, 0.95, 0.2, f, LMode.Steady, c.rnd);
   const zt = s.z - 0.2, hz = c.bk.get('hazard'), e = terrace(s.hw) - 0.3;
-  hz.quad([-e, DECK + 0.04, zt - 2.2], [e, DECK + 0.04, zt - 2.2], [e, DECK + 0.04, zt], [-e, DECK + 0.04, zt], [0, 0], [e / 4, 0], [e / 4, 1], [0, 1], P.accent, [0, 1, 0]);
+  if (stern) hz.quad([-e, DECK + 0.04, zt - 2.2], [e, DECK + 0.04, zt - 2.2], [e, DECK + 0.04, zt], [-e, DECK + 0.04, zt], [0, 0], [e / 4, 0], [e / 4, 1], [0, 1], P.accent, [0, 1, 0]);
   // Edge silhouette for the ghost livery: the gunwale and the belt.
   const ep: number[] = [];
   for (let i = 0; i < st.length - 1; i++) for (const sx of [1, -1]) for (const k of [3, 5]) {
@@ -378,9 +388,9 @@ interface OBox { x0: number; x1: number; z0: number; z1: number }
 const obox = (o: Obstacle, ik: number): OBox => ({ x0: (o.x - o.hw) * ik, x1: (o.x + o.hw) * ik, z0: (o.y - o.hl) * ik, z1: (o.y + o.hl) * ik });
 
 /** Forecastle on the prow: breakwater, anchor gear, hull number and the jackstaff. */
-function forecastle(c: Ctx, st: Station[], zA: number) {
+function forecastle(c: Ctx, st: Station[], zA: number, numbered = true) {
   const P = c.L.paint, LL = c.L.light, zs = st[0].z, L = zA - zs;
-  digits(c, String(10 + (c.sig % 89)).padStart(2, '0'), 0, zs + L * 0.55, 3.2);
+  if (numbered) digits(c, String(10 + (c.sig % 89)).padStart(2, '0'), 0, zs + L * 0.55, 3.2);
   for (let k = 0; k < 3; k++) chevron(c, 0, zs + L * 0.3 + k * 1.6, 2.2, 0.55, col(P.deckLine, 0.9));
   // Breakwater: a low V across the deck that throws spray (here, slipstream) off the forward turrets.
   const zb = zA + 1, e = c.de(zb) - 1.5;
@@ -564,6 +574,7 @@ function engineSection(c: Ctx, r: HullRect, ob: OBox, last: boolean) {
   // Flank drive nacelles over the belt.
   const rad = 4.2, yc = DECK - 9.5, za = z0 + 5, zb = last ? z1 + 4 : z1 - 3;
   for (const sx of [-1, 1]) {
+    if (c.nb(sx, (za + zb) / 2)) continue; // a module welded alongside: no room for the nacelle
     const x = sx * (Math.min(c.hw(za), c.hw(zb - 6)) + rad * 0.45);
     const mm = new THREE.Matrix4().makeTranslation(x, yc, za).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2));
     lathe(c.bk, B.panels, [[0, -1], [rad * 0.6, 0], [rad, 3], [rad, zb - za - 6], [rad * 0.92, zb - za - 3]], 14, col(P.hull, 1.15), mm, false, 3);
@@ -579,9 +590,9 @@ function engineSection(c: Ctx, r: HullRect, ob: OBox, last: boolean) {
   }
 }
 
-/** Main drives in the transom: two to four bells by how many engine blocks the hull carries. */
-function sternDrives(c: Ctx, s: Station, engines: number) {
-  const P = c.L.paint, LL = c.L.light, n = Math.min(4, 2 + Math.floor(engines / 2)), rad = Math.min(6.5, (s.hw * 1.5) / n) * (engines ? 1 : 0.75), y = DECK - 8;
+/** Main drives in the transom: two to four bells by how many engine blocks the hull carries (`drives` false: thrusters only). */
+function sternDrives(c: Ctx, s: Station, engines: number, drives = true) {
+  const P = c.L.paint, LL = c.L.light, n = drives ? Math.min(4, 2 + Math.floor(engines / 2)) : 0, rad = Math.min(6.5, (s.hw * 1.5) / n) * (engines ? 1 : 0.75), y = DECK - 8;
   for (let i = 0; i < n; i++) {
     const x = (i - (n - 1) / 2) * ((s.hw * 1.5) / n), mb = new THREE.Matrix4().makeTranslation(x, y, s.z - 2).multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2));
     lathe(c.bk, B.ribs, [[rad * 1.1, 0], [rad, 1.5], [rad * 1.06, 4.5], [rad * 1.22, 7.5], [rad * 1.12, 7.6]], 16, P.dark, mb);
@@ -634,19 +645,21 @@ function equipment(c: Ctx, r: HullRect, rnd: Rng) {
 }
 
 /** Navigation lights: red to port, green to starboard at the beam, white at bow and stern, strobes on top. */
-function navLights(c: Ctx, st: { z: number; hw: number }[]) {
+function navLights(c: Ctx, st: { z: number; hw: number }[], prow: boolean, stern: boolean) {
   const LL = c.L.light; let wide = st[0];
   for (const s of st) if (s.hw > wide.hw) wide = s;
   const zs = [wide.z, (st[0].z + wide.z) / 2];
+  // Port and starboard lights only on an outer side (a hull welded to another module shows none there).
   for (const z of zs) {
     const hw = c.hw(z);
-    c.lights.add(-hw - 0.3, DECK - 2.2, z, LL.navPort, 2.0, 0.35, LMode.Steady);
-    c.lights.add(hw + 0.3, DECK - 2.2, z, LL.navStar, 2.0, 0.35, LMode.Steady);
+    if (!c.nb(-1, z)) c.lights.add(-hw - 0.3, DECK - 2.2, z, LL.navPort, 2.0, 0.35, LMode.Steady);
+    if (!c.nb(1, z)) c.lights.add(hw + 0.3, DECK - 2.2, z, LL.navStar, 2.0, 0.35, LMode.Steady);
   }
   const zs0 = st[0].z, zs1 = st[st.length - 1].z;
-  c.lights.add(0, DECK + 0.4, zs0 + 0.3, LL.strobe, 1.6, 0.35, LMode.Steady);
+  if (prow) c.lights.add(0, DECK + 0.4, zs0 + 0.3, LL.strobe, 1.6, 0.35, LMode.Steady);
+  if (!stern) return;
   c.lights.add(0, DECK + 0.3, zs1 + 0.4, LL.strobe, 1.6, 0.35, LMode.Steady);
-  for (const sx of [-1, 1]) c.lights.add(sx * (c.hw(zs1 - 2) - 0.5), DECK + 0.4, zs1 - 1, LL.strobe, 3, 0.45, LMode.Strobe, sx > 0 ? 0.5 : 0);
+  for (const sx of [-1, 1]) if (!c.nb(sx, zs1 - 2)) c.lights.add(sx * (c.hw(zs1 - 2) - 0.5), DECK + 0.4, zs1 - 1, LL.strobe, 3, 0.45, LMode.Strobe, sx > 0 ? 0.5 : 0);
 }
 
 /** Sheer: the forecastle rises toward the stem (everything ahead of the first section is bent up, lights too). */
@@ -658,108 +671,197 @@ function sheer(c: Ctx, zA: number, zs: number) {
 }
 
 /* ---------------- build ---------------- */
+/**
+ * A hull run: modules stacked fore and aft on one keel line (same centre x, edge to edge). Each run is lofted as its
+ * own hull in run-local x and welded to its neighbours (bridging decks); a free-form ship is one or more runs.
+ */
+interface Run { cx: number; ids: number[]; prow: boolean; stern: boolean; hw: (z: number) => number; z0: number; z1: number }
+const EPS = 0.6;
+const xOverlap = (a: HullRect, b: HullRect) => Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+function hullRuns(rects: HullRect[]): Run[] {
+  const cx = (r: HullRect) => r.x + r.w / 2, prev = new Map<number, number>(), next = new Map<number, number>();
+  rects.forEach((a, i) => rects.forEach((b, j) => {
+    if (i === j || next.has(i) || prev.has(j)) return;
+    if (Math.abs(b.y - (a.y + a.h)) < EPS && Math.abs(cx(a) - cx(b)) < EPS) { next.set(i, j); prev.set(j, i); }
+  }));
+  const runs: Run[] = [];
+  rects.forEach((_, i) => {
+    if (prev.has(i)) return;
+    const ids = [i]; while (next.has(ids[ids.length - 1])) ids.push(next.get(ids[ids.length - 1])!);
+    const f = rects[ids[0]], l = rects[ids[ids.length - 1]];
+    // A run gets a bow when no module touches its forward edge across its beam, a stern likewise aft.
+    const blocked = (z: number, ref: HullRect, ahead: boolean) => rects.some((o, j) => !ids.includes(j) && Math.abs((ahead ? o.y + o.h : o.y) - z) < EPS && xOverlap(o, ref) > 2);
+    runs.push({ cx: cx(f), ids, prow: !blocked(f.y, f, true), stern: !blocked(l.y + l.h, l, false), hw: () => 0, z0: 0, z1: 0 });
+  });
+  return runs;
+}
+const append = (d: number[], s: number[]) => { for (let i = 0; i < s.length; i++) d.push(s[i]); };
+/** Concatenate a run's buckets and lights into the ship's, moved to the run's keel line. */
+function weld(dst: Buckets, src: Buckets, dx: number) {
+  for (const [k, mb] of src.b) {
+    const d = dst.get(k);
+    for (let i = 0; i < mb.p.length; i++) d.p.push(i % 3 === 0 ? mb.p[i] + dx : mb.p[i]);
+    append(d.n, mb.n); append(d.uv, mb.uv); append(d.c, mb.c); append(d.g, mb.g);
+  }
+}
+function weldLights(dst: LightSet, src: LightSet, dx: number) {
+  for (let i = 0; i < src.p.length; i++) dst.p.push(i % 3 === 0 ? src.p[i] + dx : src.p[i]);
+  append(dst.c, src.c); append(dst.s, src.s); append(dst.ph, src.ph); append(dst.md, src.md);
+}
+/** Bridging deck between two welded hulls: a deck slab over the gap between their decks, plated and lit. */
+function bridgeDeck(bk: Buckets, lights: LightSet, L: Livery, x0: number, x1: number, z0: number, z1: number) {
+  if (x1 - x0 < 0.5 || z1 - z0 < 2) return;
+  block(bk, octagon(x0, z0, x1, z1, Math.min(2.5, (z1 - z0) / 3)), DECK - 13, DECK - 0.02, { side: B.darkPanel, top: B.panels, col: col(L.paint.hull, 0.6), topCol: col(L.paint.hull, 0.95), bevel: 0.1, tile: 10 });
+  for (const xx of [x0 + 0.6, x1 - 0.6]) lights.row([xx, DECK + 0.1, z0 + 1.5], [xx, DECK + 0.1, z1 - 1.5], 2.2, L.light.edge, 0.9, 0.22, 0.8, LMode.Steady);
+}
+
 export function buildShip(dv: Derived, L: Livery, sigText: string, callsign = ''): ShipModel {
   // Build at the reference ship scale so every detail keeps its proportion to the hull, then scale the body.
   const k = SHIP_SCALE / REF_SCALE, ik = 1 / k;
   const rects: HullRect[] = dv.rects.map((r) => ({ ...r, x: r.x * ik, y: r.y * ik, w: r.w * ik, h: r.h * ik }));
   const mounts: Mount[] = dv.mounts.map((m) => ({ ...m, ox: m.ox * ik, oy: m.oy * ik }));
-  const sig = hash(sigText), st = stations(rects), hw = hwFn(st);
+  const sig = hash(sigText);
   const root = new THREE.Group(); root.name = L.hostile ? 'ghost-dreadnought' : 'dreadnought';
   const body = new THREE.Group(); body.scale.setScalar(k); root.add(body);
-  const c: Ctx = {
-    bk: new Buckets(), L, lights: new LightSet(), rnd: mulberry32(sig), occ: [], dmg: [], vents: [], spin: [], nozzles: [], root: body, turrets: [],
-    hw, de: (z: number) => terrace(hw(z)), z0: st[0].z, z1: st[st.length - 1].z, edgeSegs: [], sig, belt: [],
-  };
+  const bk = new Buckets(), lights = new LightSet(), rig = new GunRig();
+  const out = { dmg: [] as V3[], vents: [] as V3[], spin: [] as Spinner[], nozzles: [] as Nozzle[], turrets: [] as Turret[], edgeSegs: [] as THREE.BufferGeometry[] };
   // Each section draws from its own seeded stream: type, position and the parts it carries.
   const secRng = (i: number, salt = 0) => mulberry32(hash(`${i}|${rects[i].type}|${mounts.filter((m) => m.si === i).map((m) => m.part ? m.part.id + m.part.tier : '-').join(',')}|${salt}`));
-  const maxHw = Math.max(...st.map((s) => s.hw));
   // What blocks fire in the rules is what stands tallest in the model: towers, funnels, sponsons.
   const obs = drawnObstacles(dv.obstacles).map((o) => ({ o, b: obox(o, ik) }));
-  const obOf = (si: number) => obs.filter((q) => q.o.si === si).map((q) => q.b);
-  const towerZ = obs.find((q) => q.o.by === 'bridge')?.b, tz = towerZ ? (towerZ.z0 + towerZ.z1) / 2 : 0;
-  // Utility bays of an engine block sit aft of its funnel.
-  const utilAt = (m: Mount): [number, number] => { const r = rects[m.si]; return [m.ox, r.type === 'engine' ? r.y + r.h * 0.81 : m.oy]; };
-  // Weapon mounts first: their barbettes, casemates and sponsons claim deck before anything else.
-  const rig = new GunRig();
-  for (const m of mounts) {
-    const p = m.part, r = rects[m.si];
-    if (!p || !has(WEAPONS, p.id)) { const [ux, uz] = utilAt(m), zn = utilZone(r.type, ux, uz); claim(c, zn[0], zn[1], zn[2], zn[3]); continue; }
-    const trav = mountTraverse(m, r.type), h = hw(m.oy);
-    // Superfiring: of a Gun Deck's two turrets the one nearer the tower stands higher; a battery's centre turret fires over its casemates.
-    const mate = mounts.find((q) => q.si === m.si && q !== m && r.type === 'gundeck');
-    const lift = r.type === 'battery' ? (Math.abs(m.ox) < 1 ? SPON_H + 5.5 : 0) : r.type === 'bridge' ? 3.2 : mate && Math.abs(m.oy - tz) < Math.abs(mate.oy - tz) ? 6 : 1.6;
-    const sb = r.type === 'battery' && Math.abs(m.ox) >= 1 ? obOf(m.si).find((b) => Math.sign(b.x0 + b.x1) === Math.sign(m.ox)) : undefined;
-    const sponson = sb ? { outer: Math.max(Math.abs(sb.x0), Math.abs(sb.x1)), top: DECK + SPON_H, z0: sb.z0, z1: sb.z1 } : undefined;
-    const { t, claim: cl } = buildMount({ uid: p.uid, id: p.id, tier: p.tier, x: m.ox, z: m.oy, deck: sponson ? sponson.top : DECK, trav, hw: h, terrace: terrace(h), gallery: DECK - 2.4, lift, sponson }, rig, c.bk, L, c.lights);
-    c.turrets.push(t); claim(c, cl[0], cl[1], cl[2], cl[3]);
-  }
-  hull(c, st);
-  deck(c, st, rects, maxHw);
-  navLights(c, st);
-  c.rnd = mulberry32(sig ^ 0x2c1b3c6d);
-  forecastle(c, st, rects[0].y);
-  sternDrives(c, st[st.length - 1], rects.filter((r) => r.type === 'engine').length);
-  rects.forEach((r, i) => {
-    c.rnd = secRng(i);
-    const ob = obOf(i);
-    switch (r.type) {
-      case 'bridge': bridgeSection(c, r, ob[0]); break;
-      case 'gundeck': gundeckSection(c, r); break;
-      case 'battery': batterySection(c, r, ob); break;
-      case 'armor': armorSection(c, r); break;
-      case 'spine': spineSection(c, r); break;
-      case 'engine': engineSection(c, r, ob[0], i === rects.length - 1); break;
-    }
-    // Section seams: a raised rib across the deck, a line of lights and a stencilled frame number.
-    if (i > 0) {
-      const z = r.y, e = Math.min(c.de(z - 0.5), c.de(z + 0.5)) - 0.2;
-      box(c.bk, B.ribs, 2 * e, 0.35, 0.7, col(L.paint.hull, 0.8), new THREE.Matrix4().makeTranslation(0, DECK + 0.17, z));
-      c.lights.row([-e + 1, DECK + 0.45, z], [e - 1, DECK + 0.45, z], 1.2, L.light.edge, 0.9, 0.2, 0.7, LMode.Steady, c.rnd);
-      const fx = e - 4;
-      if (!occupied(c, fx - 2, z + 0.6, fx + 2, z + 2, 0)) { stencilText(c, `FR ${String(i * 40 + 12).padStart(3, '0')}`, fx, z + 1.3, 0.8); claim(c, fx - 2, z + 0.6, fx + 2, z + 2); }
-    }
-  });
-  // Callsign stencilled across the aft deck, and again small on the bow.
+  const towers = obs.filter((q) => q.o.by === 'bridge').map((q) => q.b);
+  const runs = hullRuns(rects), main = runs.reduce((a, r) => (r.ids.length > a.ids.length ? r : a), runs[0]);
   const cs = (callsign || (L.hostile ? 'UNKNOWN' : 'DREADNOUGHT')).toUpperCase().replace(/[^A-Z0-9 .\-]/g, '').slice(0, 14);
-  {
-    const last = rects[rects.length - 1], zz = last.y + last.h - 8, w = cs.length * 1.4 * 0.72;
-    if (!occupied(c, -w / 2, zz - 1, w / 2, zz + 1, 0)) { stencilText(c, cs, 0, zz, 1.4); claim(c, -w / 2, zz - 1, w / 2, zz + 1); }
-    stencilText(c, cs, 0, st[0].z + (rects[0].y - st[0].z) * 0.82, 0.7);
-  }
-  // Utility modules: small installations bedded into the deck (utilities.ts), seeded per section and slot.
-  for (const m of mounts) {
-    const p = m.part; if (p && has(WEAPONS, p.id)) continue;
-    const r = rects[m.si], [ux, uz] = utilAt(m);
-    utilityModule(c, secRng(m.si, 10 + m.i), { id: p?.id ?? '', tier: p?.tier ?? 1, x: ux, z: uz, zone: utilZone(r.type, ux, uz), za: r.y, zb: r.y + r.h });
-  }
-  // Medium equipment, then the dense small layer, section by section; hull-side detail last.
-  rects.forEach((r, i) => {
-    const rnd = secRng(i, 1);
-    equipment(c, r, rnd);
-    deckGreebles(c, rnd, r.y, r.y + r.h, r.type);
-    beltGreebles(c, rnd, r.y, r.y + r.h, r.type, DECK);
-  });
-  // Fill damage points so fires can break out anywhere on the hull.
-  c.rnd = mulberry32(sig ^ 0x5bd1e995);
-  for (let i = 0; i < 26; i++) { const z = c.z0 + 8 + c.rnd() * (c.z1 - c.z0 - 14), w = c.de(z) - 4; c.dmg.push([(c.rnd() * 2 - 1) * w, DECK + 0.4, z]); }
+  // Another module welded beside rect i on side sd at z (ship space).
+  const beside = (i: number, sd: number, z: number) => { const r = rects[i]; return rects.some((o, j) => j !== i && z >= o.y - EPS && z <= o.y + o.h + EPS && Math.abs(sd < 0 ? o.x + o.w - r.x : o.x - (r.x + r.w)) < EPS); };
 
-  sheer(c, rects[0].y, st[0].z);
-  c.bk.meshes(L.mats, body, true);
+  for (const run of runs) {
+    const dx = run.cx, R: HullRect[] = [];
+    for (const i of run.ids) R[i] = { ...rects[i], x: rects[i].x - dx };
+    const rr = run.ids.map((i) => R[i]), st = stations(rr, run.prow, run.stern), hw = hwFn(st);
+    run.hw = hw; run.z0 = rr[0].y; run.z1 = rr[rr.length - 1].y + rr[rr.length - 1].h;
+    const rectAt = (z: number) => run.ids.find((i) => z >= rects[i].y - EPS && z <= rects[i].y + rects[i].h + EPS) ?? run.ids[0];
+    const c: Ctx = {
+      bk: new Buckets(), L, lights: new LightSet(), rnd: mulberry32(sig ^ run.ids[0]), occ: [], dmg: [], vents: [], spin: [], nozzles: [], root: body, turrets: [],
+      hw, de: (z: number) => terrace(hw(z)), z0: st[0].z, z1: st[st.length - 1].z, edgeSegs: [], sig, belt: [],
+      nb: (sd, z) => beside(rectAt(z), sd, z),
+    };
+    const g0 = rig.guns.length;
+    const obOf = (si: number) => obs.filter((q) => q.o.si === si).map((q) => ({ x0: q.b.x0 - dx, x1: q.b.x1 - dx, z0: q.b.z0, z1: q.b.z1 }));
+    // Superfiring: of a Gun Deck's two turrets the one nearer this hull's bridge tower stands higher (with no tower on
+    // the run, the one nearer amidships of the run); a battery's centre turret fires over its casemates.
+    const own = towers.filter((b) => Math.abs((b.x0 + b.x1) / 2 - dx) < 3), mid = (run.z0 + run.z1) / 2;
+    const refZ = (z: number) => (own.length ? Math.min(...own.map((b) => Math.abs(z - (b.z0 + b.z1) / 2))) : Math.abs(z - mid));
+    const utilAt = (m: Mount): [number, number] => { const r = R[m.si]; return [m.ox - dx, r.type === 'engine' ? r.y + r.h * 0.81 : m.oy]; };
+    const ms = mounts.filter((m) => run.ids.includes(m.si));
+    // Weapon mounts first: their barbettes, casemates and sponsons claim deck before anything else.
+    for (const m of ms) {
+      const p = m.part, r = R[m.si], x = m.ox - dx;
+      if (!p || !has(WEAPONS, p.id)) { const [ux, uz] = utilAt(m), zn = utilZone(r.type, ux, uz); claim(c, zn[0], zn[1], zn[2], zn[3]); continue; }
+      const trav = mountTraverse(m, r.type), h = hw(m.oy);
+      const mate = r.type === 'gundeck' ? ms.find((q) => q.si === m.si && q !== m && q.part && has(WEAPONS, q.part.id)) : undefined;
+      const up = mate ? refZ(m.oy) < refZ(mate.oy) - 0.5 || (Math.abs(refZ(m.oy) - refZ(mate.oy)) <= 0.5 && m.ring > mate.ring) : false;
+      const lift = r.type === 'battery' ? (Math.abs(x) < 1 ? SPON_H + 5.5 : 0) : r.type === 'bridge' ? 3.2 : up ? 6 : 1.6;
+      const sb = r.type === 'battery' && Math.abs(x) >= 1 ? obOf(m.si).find((b) => Math.sign(b.x0 + b.x1) === Math.sign(x)) : undefined;
+      const sponson = sb ? { outer: Math.max(Math.abs(sb.x0), Math.abs(sb.x1)), top: DECK + SPON_H, z0: sb.z0, z1: sb.z1 } : undefined;
+      const { t, claim: cl } = buildMount({ uid: p.uid, id: p.id, tier: p.tier, x, z: m.oy, deck: sponson ? sponson.top : DECK, trav, hw: h, terrace: terrace(h), gallery: DECK - 2.4, lift, sponson, ring: m.ring }, rig, c.bk, L, c.lights);
+      c.turrets.push(t); claim(c, cl[0], cl[1], cl[2], cl[3]);
+    }
+    hull(c, st, run.stern);
+    deck(c, st, rr, Math.max(...st.map((s) => s.hw)));
+    navLights(c, st, run.prow, run.stern);
+    c.rnd = mulberry32(sig ^ 0x2c1b3c6d ^ run.ids[0]);
+    if (run.prow) forecastle(c, st, rr[0].y, run === main);
+    // Main drives on the main hull and on any hull carrying an engine block; side hulls without one only manoeuvre.
+    const engines = rr.filter((r) => r.type === 'engine').length;
+    if (run.stern) sternDrives(c, st[st.length - 1], engines, run === main || engines > 0);
+    rr.forEach((r, n) => {
+      const i = run.ids[n];
+      c.rnd = secRng(i);
+      const ob = obOf(i);
+      switch (r.type) {
+        case 'bridge': bridgeSection(c, r, ob[0]); break;
+        case 'gundeck': gundeckSection(c, r); break;
+        case 'battery': batterySection(c, r, ob); break;
+        case 'armor': armorSection(c, r); break;
+        case 'spine': spineSection(c, r); break;
+        case 'engine': engineSection(c, r, ob[0], n === rr.length - 1 && run.stern); break;
+      }
+      // Section seams: a raised rib across the deck, a line of lights and a stencilled frame number.
+      if (n > 0) {
+        const z = r.y, e = Math.min(c.de(z - 0.5), c.de(z + 0.5)) - 0.2;
+        box(c.bk, B.ribs, 2 * e, 0.35, 0.7, col(L.paint.hull, 0.8), new THREE.Matrix4().makeTranslation(0, DECK + 0.17, z));
+        c.lights.row([-e + 1, DECK + 0.45, z], [e - 1, DECK + 0.45, z], 1.2, L.light.edge, 0.9, 0.2, 0.7, LMode.Steady, c.rnd);
+        const fx = e - 4;
+        if (!occupied(c, fx - 2, z + 0.6, fx + 2, z + 2, 0)) { stencilText(c, `FR ${String(i * 40 + 12).padStart(3, '0')}`, fx, z + 1.3, 0.8); claim(c, fx - 2, z + 0.6, fx + 2, z + 2); }
+      }
+    });
+    // Callsign stencilled across the main hull's aft deck, and again small on its bow.
+    if (run === main) {
+      const last = rr[rr.length - 1], zz = last.y + last.h - 8, w = cs.length * 1.4 * 0.72;
+      if (!occupied(c, -w / 2, zz - 1, w / 2, zz + 1, 0)) { stencilText(c, cs, 0, zz, 1.4); claim(c, -w / 2, zz - 1, w / 2, zz + 1); }
+      if (run.prow) stencilText(c, cs, 0, st[0].z + (rr[0].y - st[0].z) * 0.82, 0.7);
+    }
+    // Utility modules: small installations bedded into the deck (utilities.ts), seeded per section and slot.
+    for (const m of ms) {
+      const p = m.part; if (p && has(WEAPONS, p.id)) continue;
+      const r = R[m.si], [ux, uz] = utilAt(m);
+      utilityModule(c, secRng(m.si, 10 + m.i), { id: p?.id ?? '', tier: p?.tier ?? 1, x: ux, z: uz, zone: utilZone(r.type, ux, uz), za: r.y, zb: r.y + r.h });
+    }
+    // Medium equipment, then the dense small layer, section by section; hull-side detail last.
+    rr.forEach((r, n) => {
+      const rnd = secRng(run.ids[n], 1);
+      equipment(c, r, rnd);
+      deckGreebles(c, rnd, r.y, r.y + r.h, r.type);
+      beltGreebles(c, rnd, r.y, r.y + r.h, r.type, DECK);
+    });
+    // Fill damage points so fires can break out anywhere on the hull.
+    c.rnd = mulberry32(sig ^ 0x5bd1e995 ^ run.ids[0]);
+    const nd = Math.round((26 * (c.z1 - c.z0)) / Math.max(1, dv.len * ik));
+    for (let i = 0; i < nd; i++) { const z = c.z0 + 8 + c.rnd() * (c.z1 - c.z0 - 14), w = c.de(z) - 4; c.dmg.push([(c.rnd() * 2 - 1) * w, DECK + 0.4, z]); }
+    if (run.prow) sheer(c, rr[0].y, st[0].z);
+    // Weld the run onto the ship at its keel line.
+    weld(bk, c.bk, dx); weldLights(lights, c.lights, dx);
+    for (let g = g0; g < rig.guns.length; g++) { const gun = rig.guns[g]; gun.px += dx; rig.u.uGunA.value[g * 4] += dx; }
+    for (const t of c.turrets) t.x += dx;
+    for (const sp of c.spin) sp.obj.position.x += dx;
+    for (const e of c.edgeSegs) e.translate(dx, 0, 0);
+    const mv = (p: V3): V3 => [p[0] + dx, p[1], p[2]];
+    out.dmg.push(...c.dmg.map(mv)); out.vents.push(...c.vents.map(mv)); out.spin.push(...c.spin); out.turrets.push(...c.turrets); out.edgeSegs.push(...c.edgeSegs);
+    out.nozzles.push(...c.nozzles.map((n) => ({ ...n, x: n.x + dx })));
+  }
+  // Welds between hulls: bridging decks where modules sit side by side, and where runs meet fore and aft off-centre.
+  const runOf = (i: number) => runs.find((r) => r.ids.includes(i))!;
+  const deckEdge = (run: Run, z: number, sd: number) => run.cx + sd * terrace(run.hw(z));
+  rects.forEach((a, i) => rects.forEach((b, j) => {
+    const ra = runOf(i), rb = runOf(j); if (ra === rb) return;
+    const z0 = Math.max(a.y, b.y) + 1.5, z1 = Math.min(a.y + a.h, b.y + b.h) - 1.5;
+    if (Math.abs(a.x + a.w - b.x) < EPS && z1 - z0 > 2) {
+      const zs = [z0, (z0 + z1) / 2, z1];
+      bridgeDeck(bk, lights, L, Math.min(...zs.map((z) => deckEdge(ra, z, 1))) - 0.5, Math.max(...zs.map((z) => deckEdge(rb, z, -1))) + 0.5, z0, z1);
+    }
+    if (Math.abs(a.y + a.h - b.y) < EPS && xOverlap(a, b) > 2) {
+      const z = b.y, x0 = Math.max(deckEdge(ra, z - 1, -1), deckEdge(rb, z + 1, -1)), x1 = Math.min(deckEdge(ra, z - 1, 1), deckEdge(rb, z + 1, 1));
+      bridgeDeck(bk, lights, L, x0, x1, z - 5, z + 5);
+    }
+  }));
+
+  bk.meshes(L.mats, body, true);
   const gunTris = rig.build(L, body);
-  const lights = c.lights.points(lightMaterial(L.hostile)); body.add(lights);
+  const pts = lights.points(lightMaterial(L.hostile)); body.add(pts);
   // Scorch decals: hidden until the hull is hurt (draw range grows with damage).
-  const sb = new Buckets(), dm = sb.get('scorch');
-  for (const p of c.dmg) { const r = 3 + c.rnd() * 5, a = c.rnd() * Math.PI; const ca = Math.cos(a) * r, sa = Math.sin(a) * r; const y = p[1] + 0.12;
+  const rnd = mulberry32(sig ^ 0x1234567), sb = new Buckets(), dm = sb.get('scorch');
+  for (const p of out.dmg) { const r = 3 + rnd() * 5, a = rnd() * Math.PI; const ca = Math.cos(a) * r, sa = Math.sin(a) * r; const y = p[1] + 0.12;
     dm.quad([p[0] - ca + sa, y, p[2] - sa - ca], [p[0] + ca + sa, y, p[2] + sa - ca], [p[0] + ca - sa, y, p[2] + sa + ca], [p[0] - ca - sa, y, p[2] - sa + ca], [0, 0], [1, 0], [1, 1], [0, 1], L.paint.hull, [0, 1, 0]); }
   const scorch = sb.meshes(L.mats, body, false)[0];
   scorch.geometry.setDrawRange(0, 0);
   let edges: THREE.LineSegments | null = null;
-  if (L.hostile && c.edgeSegs.length) {
+  if (L.hostile && out.edgeSegs.length) {
     // The hostile identification: a hairline rim, not a neon outline. The hull silhouette carries it at
     // full strength, superstructure roof edges at a third; the layer breathes the opacity slowly. It stays
     // well under the bloom threshold, so it never thickens into a glow.
     const pos: number[] = [], cl: number[] = [];
-    for (const g of c.edgeSegs) {
+    for (const g of out.edgeSegs) {
       const a = g.getAttribute('position'), w = g.userData.k ?? 0.35;
       for (let i = 0; i < a.count; i++) { pos.push(a.getX(i), a.getY(i) + 0.05, a.getZ(i)); cl.push(w, w, w); }
       g.dispose();
@@ -767,15 +869,15 @@ export function buildShip(dv: Derived, L: Livery, sigText: string, callsign = ''
     const eg = new THREE.BufferGeometry(); eg.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); eg.setAttribute('color', new THREE.Float32BufferAttribute(cl, 3));
     const em = new THREE.LineBasicMaterial({ color: '#ff4636', vertexColors: true, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false }); em.color.multiplyScalar(0.9); em.toneMapped = false;
     edges = new THREE.LineSegments(eg, em); edges.userData.own = true; body.add(edges);
-  } else for (const g of c.edgeSegs) g.dispose();
+  } else for (const g of out.edgeSegs) g.dispose();
   let tris = 0; body.traverse((o) => { const g = (o as THREE.Mesh).geometry; if ((o as THREE.Mesh).isMesh && g) tris += (g.index ? g.index.count : g.getAttribute('position').count) / 3; });
   void gunTris;
   // Layer-facing data lives in root space (body space x k).
   const toRoot = (p: V3): V3 => [p[0] * k, p[1] * k, p[2] * k];
   return {
-    root, body, k, turrets: c.turrets, rig,
-    nozzles: c.nozzles.map((n) => ({ ...n, x: n.x * k, y: n.y * k, z: n.z * k, r: n.r * k })),
-    dmgPts: c.dmg.map(toRoot), vents: c.vents.map(toRoot), spinners: c.spin, lights, edges, scorch, len: dv.len, width: dv.width, hostile: L.hostile, tris,
+    root, body, k, turrets: out.turrets, rig,
+    nozzles: out.nozzles.map((n) => ({ ...n, x: n.x * k, y: n.y * k, z: n.z * k, r: n.r * k })),
+    dmgPts: out.dmg.map(toRoot), vents: out.vents.map(toRoot), spinners: out.spin, lights: pts, edges, scorch, len: dv.len, width: dv.width, hostile: L.hostile, tris,
   };
 }
 
