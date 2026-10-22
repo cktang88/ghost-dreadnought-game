@@ -427,42 +427,54 @@ tests/unit/balance.test.ts --disable-console-intercept` prints the table (`ONLY=
 At true warship scale the guns are a few pixels on the hull, so the refit screen is an engineering callout drawing: the
 ship's plan (`drawBlueprint` with an explicit `fit`) on a blueprint sheet, and every mount called out by a leader line to a
 hand-sized, not-to-scale socket tile around it. Opened from the map (`#btn-refit`) and from the merchant's "Refit ship"
-service, which also passes the counter (`market`, `sections` getters on `RefitExtras`).
-- **Layout** (`layoutBoard`, pure): bow mount tile above the ship, port mounts (`ox < 0`) in the left column, starboard in the
-  right, centreline mounts to the shorter column. Tiles sit level with their mount where they can (`resolve1D` spreads
-  them in order inside the column), shrinking to 40 px when a column is crowded (`compact`). Anchors are where the mount is
-  drawn (`mountDrawPos` in `shipPreview.ts`: broadside guns sit on their sponsons). Leaders run tile edge -> stub ->
-  diagonal across the gutter -> level run over the hull -> mount; the diagonals share two vertical lines in the same order
-  as the level runs, so a column's leaders cannot cross. Mounts level with each other (a battery's flank gun and centre
-  bay) get runs `LEVEL_STEP` (15 px) apart. Below `STACK_BELOW` (640 px board width, phones) it stacks: ship on top with
-  numbered balloons, numbered tiles listed under it. `tests/unit/refitBoard.test.ts` holds every hull and the worst
-  8-section builds at four board sizes to: tiles in bounds, no overlaps, zero crossings, no leader through a tile, sides correct.
-- **Moves** (pure): `Src` = hold / mount / counter, `Dst` = mount / hold. `checkMove` gives `ok` or a refusal (`kind`: wrong slot
-  kind, `scrap`: counter part not affordable, `same`, `noop`) with the reason shown on the socket; `applyMove` swaps mount to
-  mount, sends a replaced part to the hold, unmounts to the hold; `previewMove` returns the build a move would leave. Sections:
-  `canMoveSection` / `moveSection` (insert; the bridge stays at the bow), `canCutSection` / `cutSection` (parts to the hold).
-  The board applies every one inside `changeBuild(run, ...)` exactly as the old refit did; counter parts are bought with the
-  merchant's own purchase function (`buyPart` in main.ts: scrap, sold flag, part into the hold) and then moved from the hold.
-- **Preview**: while a part is picked or carried, every socket gets `.cand` (lit, with the arc tag and target layers the part
-  would get there from `mountTraverse`, and its top stat deltas) or `.nope` (dimmed, with the reason). The socket under the
-  pointer draws the firing-arc wedge on the plan (ventral ordnance: drop rings), redraws the ship with the previewed build and
-  shows `statDeltas` in the particulars panel (hull, speed, fire rate, shield, rated anti-air / anti-ground dmg/s from
-  `firepower()`, mass, thrust, PD, repair, drones). A section drag redraws the reordered hull at its own fit.
-- **Drag** (`draggable(el, hooks)`): pointer events, one path for mouse, pen and touch. Mouse/pen start after 6 px of travel,
-  a finger after a 260 ms press-and-hold (a quick swipe still scrolls). Targets are `[data-drop]` elements
-  (`slot:<si>:<i>`, `hold`, `sec:<i>`, `cut`); the carried tile is a clone hung below-right of the pointer (so the socket under it stays
-  readable) that snaps into the target (150 ms overshoot) or springs back. Edge auto-scroll while carrying (phones: hold below the board). Escape cancels. The board does not re-render
-  mid-drag (`dragging()`).
-- **Feedback**: landing plays `uiSound('stamp')` (a counter purchase `'buy'`), the socket does a clunk (scale overshoot and a
-  well flash) and its leader and ring flash; refused drops `'deny'` and wobble. Gauges rebuild only when the committed fit
-  changes, so needles swing once per refit.
-- **Click and keyboard**: click (or Enter) a hold part to pick it, then a socket to place it; click a mounted part to pick it
-  up, then another socket to swap or "Return to hold"; Delete unmounts the focused socket; Esc lets go. Sections also keep
-  their ▲ ▼ buttons and guarded Cut switch; dropping a section in the cut bin asks for confirmation.
-- Screenshots: `docs/shots/ui-refit-*.jpg` (board idle, drag over a lit / refused socket, equipped, swap, section drag,
-  merchant counter, an 8-section build, phone).
-- Hooks for tests: `.mtile[data-slot="si-i"]` (`.cand`, `.nope`, `.over`), `[data-inv]`, `[data-mkt]`, `.rf-hold`,
-  `li.sec[data-sec]`, `.rf-toast`, `.board-lines .lead` / `.arc-w.hot`.
+service, which also passes the counter (`market`, `sections` getters on `RefitExtras`; `rings` allows turret ring refits,
+default: when a counter came along). Position, facing, ring and shape are the strategy; the board shows all four.
+- **Plan** (`shipPreview.ts`): a ship of any grid shape. The outline is the union of every module's hull proper, a clipper bow
+  on every module whose bow is open, a stern taper on every open stern (`planExtent` = how far they reach past the bounding
+  box) and battery sponsons (`drawnObstacles`). Module seams are dashed (each module is a block you can move); the bridge
+  tower and funnels are raised (shadow, hatching, dashed outline: they mask fire). Mounts are drawn where they sit and turned
+  to their facing.
+- **Layout** (`layoutBoard`, pure, `anchorsFor(d)`): the bridge gun's tile goes above the ship only when it is the foremost
+  mount; port mounts (`ox < -1`) left, starboard right, centreline mounts to the shorter column. Tiles sit level with their
+  mount (`resolve1D`), shrinking to 40 px when crowded (`compact`). Leaders: tile edge -> stub -> diagonal across the gutter ->
+  level run over the hull -> mount, so a column's leaders cannot cross; mounts level with each other get runs `LEVEL_STEP`
+  apart. Below `STACK_BELOW` (640 px, phones) it stacks. `tests/unit/refitBoard.test.ts` holds every hull, column, hammerhead,
+  outrigger and wide eight-module builds at four sizes to: tiles in bounds, no overlaps, zero crossings, no leader through a
+  tile, sides correct, the whole plan (bow and stern) on the sheet.
+- **Arcs and reach**: every gun whose facing matters draws its masked arc (`arcView`: open sectors, and blocked wedges clipped
+  to its arc, hatched red and on the hot mount labelled BRIDGE TOWER / FUNNEL / SPONSON / ... via `BLOCK_NAME`). Fan radius is
+  the gun's reach (`Mount.range`) on one common range scale (`rangeK`: true reach would cover the sheet); the hovered mount's
+  fan is at full reach with a dashed range ring and the number, the others at 42%. Ventral ordnance draws its ground reach
+  rings. Tiles show the range (`⌖720`).
+- **Facing**: each weapon tile has a rotate strip (⟳ / facing "FS↗" and turret ring pips / ⟲); R / Shift+R or the wheel over a
+  mount (tile or plan) turn it (`rotateMount`). Bombs, mortars and all-round weapons refuse with the reason (`rotateWhy`).
+- **Turret rings**: the hovered or focused socket shows a ring chip ("RING II · 60¤"); hovering previews the wider arc and the
+  compare card, click or U buys it (`ringUpgradeCost`, `upgradeRing`, scrap off `run.scrap`) where `rings` is allowed.
+- **Module grid**: drag a module on the plan (grab it away from its guns), from the module list, or a new module from a work
+  slip on the counter. While carried the plan holds still in the frame the drag started in (`planOffset`, `spotAt`,
+  `spotBox`), every legal spot shows as a ghost outline (`placeSpots`: `attachSpots` + `placeIssue`), the drop snaps to the
+  nearest within 16 design units (`dropSpot`) or shows red with the reason, and the plan, every arc, the rose and the stats
+  preview the reshaped ship (`previewPlacing`). A drop commits through `placeModule` (a counter module is bought first, then
+  placed; `addSection` puts it astern where it joins). The list keeps ◀ ▲ ▼ ▶ nudges and arrow keys on a focused row
+  (`nudgeSpot`: the next legal spot that way), the guarded Cut switch and the cut bin.
+- **Compare card** (`.rf-cmp`, top of the particulars): whenever something is being tried (a part over a socket, a rotate or
+  ring button hovered, a module over a spot) it lists NOW vs NEW with green / red changes: the mount (`mountCard`: part, air
+  and ground dmg/s, cooldown, range, clear arc after blocking, engages, ring) and the ship (`shipCard`: hull, speed, anti-air,
+  anti-ground, worst coverage gap).
+- **Coverage rose**: dmg/s bearing on each of `ROSE_BINS` bearings (`coverage`), air and ground, around a ship glyph, the four
+  quarters' means, and the worst gap called out (`weakestQuarter`: BLIND / NO AA / NO GROUND FIRE + quarter, else THINNEST).
+- **Moves** (pure): `Src` = hold / mount / counter, `Dst` = mount / hold; `checkMove` (refusals `kind`, `scrap`, `same`, `noop`),
+  `applyMove`, `previewMove`; `canCutSection` keeps the hull joined. Every change goes through `changeBuild(run, ...)`.
+- **Drag** (`draggable(el, hooks)`): pointer events, one path for mouse, pen and touch (finger: 260 ms hold). Targets are
+  `[data-drop]` (`slot:<si>:<i>`, `hold`, `cut`); hooks may add `move(x, y)` (spot drops) and `snapTo()` (where a committed
+  drop snaps); a ghost with `data-own-size` keeps its size. Escape cancels; the board does not re-render mid-drag.
+- **Click and keyboard**: click (or Enter) a hold part, then a socket; Delete unmounts the focused socket; Esc lets go; R / U on
+  the focused or hovered mount; arrows on a focused module row.
+- Screenshots: `docs/shots/ui-refit-grid-*.jpg` (hammerhead, module drag, outrigger, ring compare, part compare, counter
+  weld), `ui-refit-facing-*.jpg`, older `ui-refit-*.jpg`.
+- Hooks for tests: `.mtile[data-slot="si-i"]` (`.cand`, `.nope`, `.over`), `.mslot[data-mslot]` (`.rot-cw`, `.rot-ccw`,
+  `.ring-chip`), `[data-inv]`, `[data-mkt]`, `.rf-hold`, `li.sec[data-sec]`, `.wslip[data-weld]`, `.rf-cmp`, `.rf-toast`,
+  `.board-lines .lead` / `.arc-w.hot` / `.spot` / `.spot-on`.
 
 ## Ship rendering (`src/render/ship/`)
 - `hull.ts` builds a hull at the reference scale (`SHIP_SCALE` 2.6) and scales a `body` group by `SHIP_SCALE / 2.6`, so every detail keeps its proportion if the ship scale changes. Layer-facing points (`nozzles`, `vents`, `dmgPts`) are in root space; turret pivots are in body space (`model.k`).

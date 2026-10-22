@@ -1,6 +1,6 @@
 // 2D blueprint view of a ship, used on menus (refit, merchant, boss intel).
-// The plan of a long, narrow capital ship: a pointed bow ahead of the first frame, a tapered stern behind the last,
-// frames of plating and machinery between, battery sponsons bulging from the sides, and the raised structures that
+// The plan of a capital ship of any shape built from grid modules: a clipper bow on every open bow, a tapered stern
+// on every open stern, modules of plating and machinery between, battery sponsons bulging from the sides, and the raised structures that
 // mask the ship's own guns (bridge tower, engine funnels) drawn with a shadow and a dashed "above deck" outline.
 // Every weapon mount is drawn where it sits and turned to its facing, so the drawing reads as a warship plan.
 import { HULL_BEAM, WEAPONS, drawnObstacles, facingAngle, facingMatters, partDef, positionArc, type Derived, type Obstacle, type Rect } from '../data/parts';
@@ -15,33 +15,52 @@ type M = Derived['mounts'][number];
 
 /** Half-beam of the hull proper in a section (a battery's rect includes its sponsons). */
 export const halfBeam = (r: Rect) => (r.type === 'battery' ? Math.min(r.w, HULL_BEAM * SHIP_SCALE) : r.w) / 2;
-/** Plan length drawn ahead of the first frame (the pointed bow) and behind the last (the stern), ship units. */
+type Pt = [number, number];
+const cxOf = (r: Rect) => r.x + r.w / 2;
+/** Is the bow (back = false) or stern edge of a module open, with no other module joined across it? */
+function exposed(dv: Derived, r: Rect, back: boolean) {
+  const b = halfBeam(r), cx = cxOf(r), y = back ? r.y + r.h : r.y;
+  return !dv.rects.some((o) => o !== r && Math.abs((back ? o.y : o.y + o.h) - y) < 0.5 && Math.min(o.x + o.w, cx + b) - Math.max(o.x, cx - b) > 1);
+}
+const bowLen = (r: Rect) => halfBeam(r) * 1.5, sternLen = (r: Rect) => halfBeam(r) * 0.45;
+/** How far the bow caps reach ahead of the ship's bounding box and the stern tapers behind it (field units). */
 export function planExtent(dv: Derived) {
   if (!dv.rects.length) return { lead: 0, tail: 0 };
-  return { lead: halfBeam(dv.rects[0]) * 1.5, tail: halfBeam(dv.rects[dv.rects.length - 1]) * 0.45 };
+  const y0 = Math.min(...dv.rects.map((r) => r.y)), y1 = Math.max(...dv.rects.map((r) => r.y + r.h));
+  let lead = 0, tail = 0;
+  for (const r of dv.rects) {
+    if (exposed(dv, r, false)) lead = Math.max(lead, y0 - (r.y - bowLen(r)));
+    if (exposed(dv, r, true)) tail = Math.max(tail, r.y + r.h + sternLen(r) - y1);
+  }
+  return { lead, tail };
 }
-
-/** Port side of the hull outline, bow point to stern corner (the starboard side mirrors it). */
-function outlinePts(dv: Derived): [number, number][] {
-  const rs = dv.rects, { lead, tail } = planExtent(dv), pts: [number, number][] = [];
-  const b0 = halfBeam(rs[0]), y0 = rs[0].y;
-  // Clipper bow: a sharp stem ahead of the first frame, swelling to the full beam with a fair tangent.
-  for (let k = 0; k <= 12; k++) { const t = k / 12; pts.push([-b0 * (1 - (1 - t) ** 2.2), y0 - lead * (1 - t)]); }
-  rs.forEach((r, i) => {
-    const b = halfBeam(r), nb = rs[i + 1] ? halfBeam(rs[i + 1]) : b, ch = Math.min(5, r.h * 0.2);
-    if (i) pts.push([-b, r.y + (Math.abs(halfBeam(rs[i - 1]) - b) > 0.5 ? ch : 0)]);
-    pts.push([-b, r.y + r.h - (Math.abs(nb - b) > 0.5 ? ch : 0)]);
-  });
-  // Tapered stern: a quarter-round into a narrow transom.
-  const L = rs[rs.length - 1], bl = halfBeam(L), yl = L.y + L.h;
-  for (let k = 1; k <= 6; k++) { const t = (k / 6) * Math.PI / 2; pts.push([-bl * (0.58 + 0.42 * Math.cos(t)), yl + tail * Math.sin(t)]); }
-  return pts;
+/**
+ * The hull as pieces whose union is the outline: every module's hull proper, a clipper bow on each module whose bow is
+ * open (the forwardmost ones), a tapered stern on each open stern, and the battery sponsons bulging out of the sides.
+ */
+function hullPieces(dv: Derived): Pt[][] {
+  const out: Pt[][] = [];
+  for (const r of dv.rects) {
+    const b = halfBeam(r), cx = cxOf(r), y1 = r.y + r.h;
+    out.push([[cx - b, r.y], [cx + b, r.y], [cx + b, y1], [cx - b, y1]]);
+    if (exposed(dv, r, false)) {
+      const L = bowLen(r), cap: Pt[] = [];
+      for (let k = 0; k <= 12; k++) { const t = k / 12; cap.push([cx - b * (1 - (1 - t) ** 2.2), r.y - L * (1 - t) + 0.01]); }
+      out.push([...cap, ...cap.slice().reverse().map(([x, y]): Pt => [2 * cx - x, y])]);
+    }
+    if (exposed(dv, r, true)) {
+      const T = sternLen(r), side: Pt[] = [[cx - b, y1 - 0.01]];
+      for (let k = 1; k <= 6; k++) { const t = (k / 6) * Math.PI / 2; side.push([cx - b * (0.58 + 0.42 * Math.cos(t)), y1 + T * Math.sin(t)]); }
+      out.push([...side, ...side.slice().reverse().map(([x, y]): Pt => [2 * cx - x, y])]);
+    }
+  }
+  for (const o of drawnObstacles(dv.obstacles)) if (o.kind === 'hull') {
+    const r = dv.rects[o.si], sd = Math.sign(o.x - cxOf(r)) || 1, b = halfBeam(r), cx = cxOf(r), outX = o.x + sd * o.hw;
+    out.push([[cx + sd * (b - 1), o.y - o.hl - 5], [outX, o.y - o.hl * 0.55], [outX, o.y + o.hl * 0.55], [cx + sd * (b - 1), o.y + o.hl + 5]]);
+  }
+  return out;
 }
-function outline(c: CanvasRenderingContext2D, pts: [number, number][]) {
-  c.beginPath(); pts.forEach(([x, y], k) => (k ? c.lineTo(x, y) : c.moveTo(x, y)));
-  for (let k = pts.length - 1; k >= 0; k--) c.lineTo(-pts[k][0], pts[k][1]);
-  c.closePath();
-}
+const poly = (c: CanvasRenderingContext2D, pts: Pt[]) => { c.beginPath(); pts.forEach(([x, y], k) => (k ? c.lineTo(x, y) : c.moveTo(x, y))); c.closePath(); };
 
 /** Plating, machinery blocks and portholes inside one frame (seeded by section, like the 3D greebles). */
 function sectionDetail(c: CanvasRenderingContext2D, r: Rect, si: number, th: Theme, px: number) {
@@ -65,15 +84,6 @@ function sectionDetail(c: CanvasRenderingContext2D, r: Rect, si: number, th: The
   c.fillStyle = th.light;
   for (let y = r.y + 1; y < r.y + r.h - 0.5; y += 1.3) for (const sx of [-1, 1]) if (rnd() < 0.55) { c.globalAlpha = 0.35 + rnd() * 0.5; c.fillRect(sx * (b - 1.2) - px * 0.6, y, px * 1.2, px * 1.2); }
   c.globalAlpha = 1;
-}
-
-/** A battery sponson: a gun platform bulging out of the side, chamfered fore and aft. */
-function sponson(c: CanvasRenderingContext2D, dv: Derived, o: Obstacle, th: Theme, px: number) {
-  const sd = Math.sign(o.x) || 1, b = halfBeam(dv.rects[o.si]), out = Math.abs(o.x) + o.hw;
-  c.beginPath();
-  c.moveTo(sd * (b - 1), o.y - o.hl - 5); c.lineTo(sd * out, o.y - o.hl * 0.55); c.lineTo(sd * out, o.y + o.hl * 0.55); c.lineTo(sd * (b - 1), o.y + o.hl + 5);
-  c.closePath(); c.fillStyle = th.hull; c.strokeStyle = th.edge; c.lineWidth = 1.2 * px; c.fill(); c.stroke();
-  c.strokeStyle = th.panel; c.lineWidth = px; c.beginPath(); c.moveTo(sd * (out - 2.5), o.y - o.hl * 0.45); c.lineTo(sd * (out - 2.5), o.y + o.hl * 0.45); c.stroke();
 }
 
 /** Raised structure: drop shadow, hatching and a dashed "above deck" outline (it masks the guns around it). */
@@ -129,30 +139,35 @@ export function drawBlueprint(canvas: HTMLCanvasElement, dv: Derived, hostile = 
   for (let y = 0; y <= h; y += step) { c.beginPath(); c.moveTo(0, y + 0.5); c.lineTo(w, y + 0.5); c.stroke(); }
   if (!dv.rects.length) return;
   const ext = planExtent(dv), full = dv.len + ext.lead + ext.tail;
+  // Intel view (no fit): the drawing is centred on the plan including its bow caps and stern tapers.
   const s = opts.fit ? opts.fit.s * k : Math.min(5, (h - 60) / full, (w - 60) / dv.width), px = 1 / s;
   c.save();
   c.translate(opts.fit ? opts.fit.cx * k : w / 2, opts.fit ? opts.fit.cy * k : h / 2 + ((hostile ? -1 : 1) * (ext.lead - ext.tail) / 2) * s);
   if (hostile) c.scale(s, -s); else c.scale(s, s);
   c.lineWidth = 1.2 * px;
-  const pts = outlinePts(dv);
-  for (const o of drawnObstacles(dv.obstacles)) if (o.kind === 'hull') sponson(c, dv, o, th, px);
-  c.fillStyle = th.hull; c.strokeStyle = th.edge; c.lineWidth = 1.4 * px; outline(c, pts); c.fill(); c.stroke();
-  c.save(); outline(c, pts); c.clip();
-  dv.rects.forEach((r, si) => { c.save(); c.beginPath(); c.rect(-r.w, r.y, r.w * 2, r.h); c.clip(); sectionDetail(c, r, si, th, px); c.restore(); });
-  // Frame seams, the keel line and the forecastle: breakwater chevron and hawse pipes.
+  // Outline by union: every piece stroked fat in the edge colour, then every piece filled over the inner edges.
+  const pieces = hullPieces(dv);
+  c.strokeStyle = th.edge; c.lineWidth = 2.8 * px; c.lineJoin = 'round';
+  for (const pc of pieces) { poly(c, pc); c.stroke(); }
+  c.fillStyle = th.hull; for (const pc of pieces) { poly(c, pc); c.fill(); }
+  dv.rects.forEach((r, si) => { const b = halfBeam(r); c.save(); c.beginPath(); c.rect(cxOf(r) - b, r.y, b * 2, r.h); c.clip(); sectionDetail(c, r, si, th, px); c.restore(); });
+  // Module seams (each module is a block you can move), and on every open bow the breakwater and hawse pipes.
   c.strokeStyle = th.edge; c.lineWidth = px;
-  dv.rects.forEach((r, si) => { if (si) { c.globalAlpha = 0.55; c.beginPath(); c.moveTo(-r.w, r.y); c.lineTo(r.w, r.y); c.stroke(); } });
-  const y0 = dv.rects[0].y, b0 = halfBeam(dv.rects[0]), yEnd = dv.rects[dv.rects.length - 1].y + dv.rects[dv.rects.length - 1].h + ext.tail;
-  c.globalAlpha = 0.3; c.setLineDash([6 * px, 4 * px]); c.beginPath(); c.moveTo(0, y0 - ext.lead + 4); c.lineTo(0, yEnd - 2); c.stroke(); c.setLineDash([]);
-  c.globalAlpha = 0.6; c.beginPath(); c.moveTo(-b0 * 0.78, y0 - 2); c.lineTo(0, y0 - ext.lead * 0.42); c.lineTo(b0 * 0.78, y0 - 2); c.stroke();
-  c.globalAlpha = 1; c.fillStyle = th.panel;
-  for (const sx of [-1, 1]) { c.beginPath(); c.arc(sx * b0 * 0.32, y0 - ext.lead * 0.62, 1.6, 0, Math.PI * 2); c.fill(); c.stroke(); }
-  c.restore();
-  c.strokeStyle = th.edge; c.lineWidth = 1.4 * px; outline(c, pts); c.stroke();
-  // Thrust: an engine block at the stern glows through the transom.
-  const last = dv.rects[dv.rects.length - 1];
-  if (last.type === 'engine') { c.fillStyle = '#ffb347'; const bl = halfBeam(last); for (const sx of [-0.3, 0.3]) c.fillRect(bl * sx - 3, yEnd - 0.5, 6, 3); }
-  for (const o of dv.obstacles) if (o.kind === 'tower') (o.by === 'bridge' ? tower : funnels)(c, o, th, px);
+  for (const r of dv.rects) {
+    const b = halfBeam(r), cx = cxOf(r);
+    c.globalAlpha = 0.4; c.setLineDash([3 * px, 2 * px]); c.strokeRect(cx - b + 0.6, r.y + 0.6, b * 2 - 1.2, r.h - 1.2); c.setLineDash([]);
+    c.globalAlpha = 0.25; c.beginPath(); c.moveTo(cx, r.y + 2); c.lineTo(cx, r.y + r.h - 2); c.stroke();
+    if (exposed(dv, r, false)) {
+      const L = bowLen(r);
+      c.globalAlpha = 0.6; c.beginPath(); c.moveTo(cx - b * 0.78, r.y - 2); c.lineTo(cx, r.y - L * 0.42); c.lineTo(cx + b * 0.78, r.y - 2); c.stroke();
+      c.globalAlpha = 1; c.fillStyle = th.panel;
+      for (const sx of [-1, 1]) { c.beginPath(); c.arc(cx + sx * b * 0.32, r.y - L * 0.62, 1.6, 0, Math.PI * 2); c.fill(); c.stroke(); }
+    }
+    // Thrust: an engine block with an open stern glows through the transom.
+    if (r.type === 'engine' && exposed(dv, r, true)) { c.globalAlpha = 1; c.fillStyle = '#ffb347'; for (const sx of [-0.3, 0.3]) c.fillRect(cx + b * sx - 3, r.y + r.h + sternLen(r) - 0.5, 6, 3); }
+  }
+  c.globalAlpha = 1;
+  for (const o of drawnObstacles(dv.obstacles)) if (o.kind === 'tower') (o.by === 'bridge' ? tower : funnels)(c, o, th, px);
   if (opts.section != null && dv.rects[opts.section]) {
     // Section outline: a hazard-amber frame with corner ticks, like a marked-up drawing.
     const r = dv.rects[opts.section], m = 3;

@@ -1,5 +1,5 @@
 // Run state: everything that persists between nodes, plus save/load.
-import { derive, starterBuild, mkPart, allParts, buildToGhost, ghostToBuild, isPart, partSlot, type Build, type Part, WEAPONS, UTILS, SECTIONS, type SectionType, MAX_SECTIONS, sectionCost } from '../data/parts';
+import { derive, starterBuild, mkPart, allParts, buildToGhost, ghostToBuild, isPart, partSlot, type Build, type Part, WEAPONS, UTILS, SECTIONS, type SectionType, MAX_SECTIONS, sectionCost, attachSpots, pinLayout } from '../data/parts';
 import { RELICS, relicMods, type Rarity } from '../data/relics';
 import { generateMap, type SectorMap } from './map';
 import { mulberry32, pick, rint, clamp, has, type Rng } from '../util/rng';
@@ -125,9 +125,17 @@ export function relicChoices(run: RunState, n: number, rarities: Rarity[]): stri
   return out;
 }
 export function addRelic(run: RunState, id: string) { changeBuild(run, () => { if (!run.relics.includes(id)) run.relics.push(id); }); }
+/**
+ * Weld a new module on: astern on the keel line, or on a placed (grid) ship at the aftmost spot where it joins the hull,
+ * nearest the keel. The refit board then moves it to the spot the player dropped it on (placeModule).
+ */
 export function addSection(run: RunState, type: SectionType) {
   if (run.build.sections.length >= MAX_SECTIONS) return false;
-  changeBuild(run, () => run.build.sections.push({ type, slots: SECTIONS[type].slots.map(() => null) }));
+  const b = run.build, spot = b.sections.some((s) => s.at) ? attachSpots(b, type).sort((p, q) => q[1] - p[1] || Math.abs(p[0]) - Math.abs(q[0]))[0] : undefined;
+  changeBuild(run, () => {
+    if (spot) pinLayout(b);
+    b.sections.push({ type, slots: SECTIONS[type].slots.map(() => null), ...(spot ? { at: spot } : {}) });
+  });
   return true;
 }
 export const nextSectionCost = (run: RunState, t: SectionType) => Math.round(sectionCost(t, run.build.sections.length) * mods(run).priceMul);

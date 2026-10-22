@@ -1,9 +1,10 @@
 // Pure logic behind the refit board (src/ui/refit.ts): where each socket tile sits around the ship and how its
 // leader line runs to the mount, what a drag would do (valid or not, and why), and the stat deltas it previews.
 // No DOM here, so tests/unit/refitBoard.test.ts can hold the layout to "no overlaps, no crossed leaders".
+import { SHIP_SCALE } from '../game/field';
 import {
-  SECTIONS, RING_MAX, canPlace, derive, facingMatters, isWeapon, layersHit, layoutIssue, layoutOf, mountArc, mountFacing, mountRing, mountTraverse,
-  nextFacing, partDef, partSlot, pinLayout, ringCost, traverseIn, wCd, wDmg,
+  SECTIONS, GRID, MAX_SECTIONS, RING_MAX, attachSpots, canPlace, derive, facingMatters, isWeapon, layersHit, layoutIssue, layoutOf, mountArc, mountFacing, mountRing, mountTraverse,
+  mountRange, nextFacing, partDef, partSlot, pinLayout, ringCost, traverseIn, wCd, wDmg,
   type Arc, type Blocked, type Build, type Derived, type Facing, type Mods, type Mount, type Part, type Sector, type SectionType, type SlotKind, type TargetLayers,
 } from '../data/parts';
 
@@ -118,6 +119,8 @@ export function placeModule(b: Build, si: number, at: [number, number]) {
   pinLayout(b); b.sections[si].at = at;
   return true;
 }
+/** The build with the next turret ring fitted to mount (si, i), for previews. */
+export function previewRing(b: Build, si: number, i: number) { const nb = cloneBuild(b); return upgradeRing(nb, si, i) ? nb : null; }
 export function previewPlace(b: Build, si: number, at: [number, number]) { const nb = cloneBuild(b); return placeModule(nb, si, at) ? nb : null; }
 /** Cutting a section loose: never the bridge; its parts land in the hold. Call inside changeBuild(). */
 export function canCutSection(b: Build, si: number) {
@@ -188,14 +191,14 @@ export function intersectSectors(a: Sector[], b: Sector[]): Sector[] {
   return out;
 }
 /** A mount's arc as the board draws it: the open (masked) sectors, and the blocked wedges clipped to its facing's arc. */
-export interface ArcView { arc: Arc; facing: Facing; open: Sector[]; blocked: Blocked[]; layers: TargetLayers; down: boolean }
+export interface ArcView { arc: Arc; facing: Facing; open: Sector[]; blocked: Blocked[]; layers: TargetLayers; down: boolean; /** Reach, field units. */ range: number; ring: number }
 /** The arc of mount (si, i) with `partId` in it (default: the part it holds; null: empty), as derived hull `d` masks it. */
 export function arcView(d: Derived, si: number, i: number, partId?: string | null): ArcView | null {
   const m = d.mounts.find((x) => x.si === si && x.i === i); if (!m) return null;
   const pid = partId === undefined ? m.part?.id ?? null : partId, type = d.rects[si].type;
   const t = traverseIn(d, si, i, pid), raw = mountTraverse(type, m.kind, pid, m.facing);
   const blocked = t.blocked.flatMap((b) => intersectSectors(raw.sectors, [b]).map((s) => ({ ...s, by: b.by })));
-  return { arc: t.arc, facing: m.facing, open: t.sectors, blocked, layers: t.layers, down: t.down };
+  return { arc: t.arc, facing: m.facing, open: t.sectors, blocked, layers: t.layers, down: t.down, range: mountRange(t.arc, pid), ring: m.ring };
 }
 /** Total angle (radians) covered by sectors. */
 export const sweep = (ss: Sector[]) => ss.reduce((n, s) => n + Math.min(Math.PI, s.h) * 2, 0);
@@ -283,6 +286,94 @@ export function statDeltas(a: Derived, b: Derived): Record<string, { d: number; 
   return out;
 }
 export const deriveOf = (b: Build, mods?: Mods) => derive(b, mods);
+
+/* ---------------- module grid on the board ---------------- */
+
+const snapG = (v: number) => Math.round(v / GRID) * GRID || 0; // never -0
+/** A copy of the build with every module pinned where it sits now (so the others hold still while one moves). */
+const pinned = (b: Build) => { const nb = cloneBuild(b); pinLayout(nb); return nb; };
+/**
+ * The field-unit offset derive() took off to centre the ship on its bounding box: field = design · SHIP_SCALE − off.
+ * The board keeps the current ship's offset while a module is dragged, so the plan holds still under the pointer.
+ */
+export function planOffset(b: Build, d: Derived): [number, number] {
+  if (!b.sections.length || !d.rects.length) return [0, 0];
+  const at = layoutOf(b)[0], t = SECTIONS[b.sections[0].type];
+  return [(at[0] - t.w / 2) * SHIP_SCALE - d.rects[0].x, at[1] * SHIP_SCALE - d.rects[0].y];
+}
+/** The grid spot (design units, snapped) for a module of `type` centred on field point (fx, fy) of a ship offset by `off`. */
+export const spotAt = (type: SectionType, fx: number, fy: number, off: [number, number]): [number, number] =>
+  [snapG((fx + off[0]) / SHIP_SCALE), snapG((fy + off[1]) / SHIP_SCALE - SECTIONS[type].h / 2)];
+/** Field-unit box (centred like derive's rects) of a module of `type` at grid spot `at`. */
+export const spotBox = (type: SectionType, at: [number, number], off: [number, number]) => {
+  const t = SECTIONS[type];
+  return { x: (at[0] - t.w / 2) * SHIP_SCALE - off[0], y: at[1] * SHIP_SCALE - off[1], w: t.w * SHIP_SCALE, h: t.h * SHIP_SCALE };
+};
+/** The module being placed: an existing one (`si`), or a new one of `type` about to be bought (si = -1). */
+export interface Placing { si: number; type: SectionType }
+/** Why the module cannot go to `at`, or null if it can. */
+export function placeIssue(b: Build, p: Placing, at: [number, number]): string | null {
+  if (p.si >= 0) return canPlace(b, p.si, at);
+  if (b.sections.length >= MAX_SECTIONS) return 'No berth: the hull is at its eight modules.';
+  return layoutIssue({ sections: [...b.sections, { type: p.type, slots: [] }] }, [...layoutOf(b), [snapG(at[0]), snapG(at[1])]]);
+}
+/** Every legal spot for the module: flush against an edge of any other module (attachSpots), plus where it is now. */
+export function placeSpots(b: Build, p: Placing): [number, number][] {
+  const lay = layoutOf(b), rest = pinned(b);
+  if (p.si >= 0) rest.sections.splice(p.si, 1);
+  const out = attachSpots(rest, p.type).filter((at) => !placeIssue(b, p, at));
+  if (p.si >= 0 && !out.some((a) => a[0] === lay[p.si][0] && a[1] === lay[p.si][1])) out.push(lay[p.si]);
+  return out;
+}
+export interface Drop { at: [number, number]; ok: boolean; why: string | null; snapped: boolean }
+/** Where a drag at `raw` lands: the nearest legal spot within `snapR` design units, else `raw` itself (legal or with the reason it is not). */
+export function dropSpot(b: Build, p: Placing, raw: [number, number], spots = placeSpots(b, p), snapR = 16): Drop {
+  let best: [number, number] | null = null, bd = snapR * snapR;
+  for (const s of spots) { const d = (s[0] - raw[0]) ** 2 + (s[1] - raw[1]) ** 2; if (d <= bd) { bd = d; best = s; } }
+  if (best) return { at: best, ok: true, why: null, snapped: true };
+  const why = placeIssue(b, p, raw);
+  return { at: raw, ok: !why, why, snapped: false };
+}
+/** The build with the module at `at` (a new module is added empty), for previews; null if it cannot go there. */
+export function previewPlacing(b: Build, p: Placing, at: [number, number]): Build | null {
+  if (p.si >= 0) return previewPlace(b, p.si, at);
+  if (placeIssue(b, p, at)) return null;
+  const nb = pinned(b); nb.sections.push({ type: p.type, slots: SECTIONS[p.type].slots.map(() => null), at: [snapG(at[0]), snapG(at[1])] });
+  return nb;
+}
+/** Keyboard nudge: the next legal spot for module si stepping (dx, dy) grid steps at a time, or null if there is none nearby. */
+export function nudgeSpot(b: Build, si: number, dx: number, dy: number, maxSteps = 60): [number, number] | null {
+  const cur = layoutOf(b)[si]; if (!cur) return null;
+  for (let k = 1; k <= maxSteps; k++) { const at: [number, number] = [cur[0] + dx * GRID * k, cur[1] + dy * GRID * k]; if (!canPlace(b, si, at)) return at; }
+  return null;
+}
+
+/* ---------------- compare cards ---------------- */
+
+/** One mount as the compare card reads it. `arc` is the clear arc in degrees after blocking (null: facing does not matter). */
+export interface MountCard { name: string; tier: number; air: number; ground: number; cd: number | null; range: number; arc: number | null; layers: TargetLayers; ring: number; arcKind: Arc }
+export function mountCard(d: Derived, si: number, i: number): MountCard | null {
+  const m = d.mounts.find((x) => x.si === si && x.i === i); if (!m) return null;
+  const p = m.part, f = mountDps(d, m);
+  return {
+    name: p ? partDef(p.id).name : m.kind === 'W' ? 'Empty mount' : 'Empty bay', tier: p?.tier ?? 0, air: f.air, ground: f.ground,
+    cd: p && isWeapon(p.id) ? wCd(p) / d.fireMult : null, range: m.range, arc: facingMatters(m.arc) ? Math.round((sweep(m.trav.sectors) * 180) / Math.PI) : null,
+    layers: p && isWeapon(p.id) ? m.trav.layers : 'none', ring: m.ring, arcKind: m.arc,
+  };
+}
+/** Ship totals for the compare card. */
+export function shipCard(d: Derived) {
+  const f = firepower(d), gap = weakestQuarter(coverage(d));
+  return { hull: d.maxHp, speed: Math.round(d.speed), air: Math.round(f.air), ground: Math.round(f.ground), gap };
+}
+/** Severity rank of a coverage gap (higher is worse), to colour a change of gap. */
+export const gapRank = (g: Gap) => (g.severity === 'blind' ? 3 : g.severity === 'gap' ? 2 : 1) + g.h / 10;
+
+/** Board anchors: every mount where it sits. The bridge gun is called out above the ship only when it is the foremost mount. */
+export function anchorsFor(d: Derived): Anchor[] {
+  const top = Math.min(...d.mounts.map((m) => m.oy));
+  return d.mounts.map((m) => ({ id: `${m.si}-${m.i}`, ox: m.ox, oy: m.oy, si: m.si, i: m.i, bow: d.rects[m.si].type === 'bridge' && m.oy <= top + 1 }));
+}
 
 /* ---------------- board layout ---------------- */
 
