@@ -125,14 +125,15 @@ describe('daily seed', () => {
   });
 });
 
-describe('run save v3', () => {
+describe('run save v4', () => {
   it('migrates a v2 save to the Vanguard at heat 0', () => {
     const r = newRun('OLD', 7);
     const v2 = { ...r, v: 2, build: buildToGhost(r.build), inv: r.inv.map((p) => [p.id, p.tier]), stats: { kills: 5, elites: 0, bosses: 0, scrapEarned: 1, nodes: 2, score: 9 } } as any;
     delete v2.hull; delete v2.heat; delete v2.seen;
     memoryStore.set('gd.run.v2', JSON.stringify(v2));
     const back = loadRun()!;
-    expect(back.v).toBe(3);
+    expect(back.v).toBe(4);
+    expect(back.od).toEqual([]);
     expect(back.hull).toBe('vanguard');
     expect(back.heat).toBe(0);
     expect(back.stats.kills).toBe(5);

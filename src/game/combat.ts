@@ -9,6 +9,7 @@ import {
 import { EN, type EnemyType, type Encounter } from '../data/enemies';
 import { hasFlag } from '../data/relics';
 import { OVERDRIVES, type OverdriveKind } from '../data/hulls';
+import { odMods, neutralOd, type OdMods } from '../data/overdriveTree';
 import { neutralHeat, type HeatFx } from '../data/heat';
 import { V, boomFx, spark, muzzle, addFx, updateFx, resetFx, broadsideFx, addTrauma, kick } from './vfx';
 import { sfx } from './audio';
@@ -64,12 +65,16 @@ export interface GameEvent {
 
 /** Ventral Lance / Lance Spear beam: a line from (x1,y1) to (x2,y2). `ground: true` means x2,y2 is on the ground plane. */
 export interface OdBeam { x1: number; y1: number; x2: number; y2: number; w: number; ground: boolean; col: string }
-/** A strike craft from the Leviathan's Strike Wing. */
-export interface Ally { x: number; y: number; vx: number; vy: number; hdg: number; cd: number; tg: Ent | null; t: number }
+/** A strike craft from the Leviathan's Strike Wing. `bomber`: carries bombs (bd = bomb reload). */
+export interface Ally { x: number; y: number; vx: number; vy: number; hdg: number; cd: number; tg: Ent | null; t: number; bomber?: boolean; bd?: number }
 export interface Overdrive {
   /** 0..1; full means ready. */ charge: number; active: boolean; kind: OverdriveKind;
   /** Seconds left while active, and the full duration. */ t: number; dur: number;
   /** Lance and spear: the live beam, else null. */ beam: OdBeam | null;
+  /** Upgrade beams beside it (Twin Lances, a Spear Fan); drawn like `beam`. */ extra: OdBeam[];
+  /** Lance (Sweep): where the beam has walked to, as an offset from the keel. */ off: { x: number; y: number };
+  /** Bulwark (Pulse): seconds to the next shockwave. */ pulseT: number;
+  /** Burn ticks so far (the Burning Furrow fires on every third). */ ticks: number;
   /** Lance: burning scorch points on the ground (they scroll with the city). life counts down from max. */
   trail: { x: number; y: number; life: number; max: number }[];
   /** Strike Wing craft. */ allies: Ally[];
@@ -88,12 +93,13 @@ export interface CombatSetup {
   ghost?: Ghost; cheatDeathAvailable: boolean;
   overdrive?: OverdriveKind; heat?: HeatFx;
   /** Overdrive charge to start with (0..1), from rank perks. */ odCharge?: number;
+  /** Overdrive upgrade picks (node ids, data/overdriveTree.ts); folded into S.odm. */ odTree?: string[];
   /** Map floor of the node (boss = 10) and the run seed: they pick the biomes below (biomes.ts biomeFor). */
   floor?: number; seed?: number;
 }
 export type CombatMode = 'play' | 'clear' | 'bossdown' | 'dying' | 'done';
 
-const newOverdrive = (kind: OverdriveKind = 'lance'): Overdrive => ({ charge: 0, active: false, kind, t: 0, dur: OVERDRIVES[kind].duration, beam: null, trail: [], allies: [], radius: 0, tick: 0 });
+const newOverdrive = (kind: OverdriveKind = 'lance'): Overdrive => ({ charge: 0, active: false, kind, t: 0, dur: OVERDRIVES[kind].duration, beam: null, extra: [], off: { x: 0, y: 0 }, pulseT: 0, ticks: 0, trail: [], allies: [], radius: 0, tick: 0 });
 const newStats = (): FightStats => ({ kills: 0, airKills: 0, groundKills: 0, elites: 0, structures: 0, broadsides: 0, maxVolley: 0, overdrives: 0, lanceStructures: 0, dmgTaken: 0, peakCarnage: 1, scrapRaw: 0, dmgBy: {}, dmgDealt: 0, dmgToTarget: 0 });
 
 export const S = {
@@ -107,6 +113,8 @@ export const S = {
   /** Biome the fight crosses into part-way (-1 none); S.theme is the biome under the ship (worldgen.ts). */
   biomeB: -1,
   overdrive: newOverdrive(), carnage: newCarnage() as Carnage, heat: neutralHeat(),
+  /** The Overdrive's upgrades this fight (odMods of the run's picks). */
+  odm: neutralOd() as OdMods,
   /** Hitstop: while stop.left > 0 the simulation is frozen (render keeps drawing). */
   stop: newStop(),
   /** Slow-mo timeline; slowK is the time scale applied this frame, slowFx 0..1 for the cinematic look. */
@@ -170,7 +178,7 @@ export function startCombat(c: CombatSetup) {
     enemies: [], pb: [], eb: [], pickups: [], beams: [], scrap: 0, kills: 0, score: 0,
     firstHitUsed: false, cheatDeath: c.cheatDeathAvailable && hasFlag(c.relics, 'cheat_death'), cheatDeathUsed: false,
     theme: biomeFor(c.sector, c.floor, c.seed).a, biomeB: biomeFor(c.sector, c.floor, c.seed).b,
-    overdrive: newOverdrive(c.overdrive ?? 'lance'), carnage: newCarnage(), heat: c.heat ?? neutralHeat(),
+    overdrive: newOverdrive(c.overdrive ?? 'lance'), odm: odMods(c.overdrive ?? 'lance', c.odTree ?? []), carnage: newCarnage(), heat: c.heat ?? neutralHeat(),
     stop: newStop(), slowmo: newSlow(), slowK: 1, slowFx: 0, events: [], pickStreak: { n: 0, t: 9 },
     stats: newStats(), seen: {}, timers: [],
     volley: [{ wait: 0, queue: [] }, { wait: 0, queue: [] }],
@@ -213,9 +221,15 @@ export function groundBlast(x: number, y: number, r: number, d: number, lance = 
 }
 
 /* ---------------- spawning ---------------- */
+/**
+ * Elite hull by sector, on top of the level scaling: 0.7 + 0.3 per sector, except sector 2, where the mid-run build
+ * meets elites at level 7 with a sector-1 arsenal (the narrower turret arcs and rear threats made those duels the
+ * longest of the run): 1.15 instead of 1.3.
+ */
+export const eliteSectorHp = (sector: number) => (sector === 2 ? 1.15 : 0.7 + 0.3 * sector);
 function spawnEnemy(type: EnemyType, x: number, y: number, o: Record<string, any> = {}): Enemy {
   const d = EN[type];
-  const hp = d.salvage ? d.hp : d.hp * hpMult() * (d.elite ? (0.7 + 0.3 * S.sector) * S.heat.eliteHp : 1);
+  const hp = d.salvage ? d.hp : d.hp * hpMult() * (d.elite ? eliteSectorHp(S.sector) * S.heat.eliteHp : 1);
   const e: Enemy = { type, layer: d.layer, x, y, r: d.r, hp, maxHp: hp, t: 0, cd: rnd(1.0, 2.4), flash: 0, dead: false, ang: Math.PI / 2, hdg: Math.PI / 2, tele: 0, ...o };
   S.enemies.push(e); return e;
 }
@@ -631,7 +645,7 @@ export function damagePlayer(d: number, src = 'unknown') {
   const P = S.P!;
   if (S.mode !== 'play' || S.god) return;
   if (!S.firstHitUsed && hasFlag(S.relics, 'first_hit_free')) { S.firstHitUsed = true; spark(P.x, P.y, '#9aa7b4', 10); setBanner('REACTIVE PLATING', 'First hit absorbed', 1.2, '#9aa7b4'); return; }
-  if (S.overdrive.active && S.overdrive.kind === 'bulwark') d *= 0.5;
+  if (S.overdrive.active && S.overdrive.kind === 'bulwark') d *= S.odm.taken;
   P.lastHit = 0;
   if (P.shield > 0) { const a = Math.min(P.shield, d); P.shield -= a; d -= a; }
   if (d > 0) {
@@ -670,88 +684,201 @@ function updateDrones(dt: number) {
 /* ---------------- overdrive ---------------- */
 export function feedOverdrive(amount: number) {
   const o = S.overdrive; if (o.active || amount <= 0 || S.mode !== 'play') return;
-  const was = o.charge; o.charge = Math.min(1, o.charge + amount);
+  const was = o.charge; o.charge = Math.min(1, o.charge + amount * S.odm.charge);
   if (was < 1 && o.charge >= 1) { emit({ type: 'overdriveReady', x: S.P!.x, y: S.P!.y, kind: o.kind }); }
 }
-/** Fire Overdrive if it is charged. Returns whether it started. */
+/** Fire Overdrive if it is charged. Returns whether it started. Upgrades (S.odm, data/overdriveTree.ts) shape it. */
 export function triggerOverdrive(): boolean {
-  const o = S.overdrive, P = S.P;
+  const o = S.overdrive, P = S.P, m = S.odm;
   if (!P || o.active || o.charge < 1 || S.mode !== 'play') return false;
-  o.active = true; o.charge = 0; o.dur = OVERDRIVES[o.kind].duration; o.t = o.dur; o.tick = 0;
+  o.active = true; o.charge = 0; o.dur = OVERDRIVES[o.kind].duration * m.dur; o.t = o.dur; o.tick = 0; o.extra = []; o.off = { x: 0, y: 0 }; o.pulseT = OD_PULSE.every;
   S.stats.overdrives++;
   setBanner(OVERDRIVES[o.kind].name.toUpperCase(), 'Overdrive', 1.2, OVERDRIVES[o.kind].col);
   requestSlow(S.slowmo, SLOWMO_SHORT); V.shake = Math.max(V.shake, 8); V.flashA = Math.max(V.flashA, 0.2);
   emit({ type: 'overdrive', x: P.x, y: P.y, kind: o.kind });
   if (o.kind === 'wing') {
-    for (let i = 0; i < 8; i++) { const a = -Math.PI / 2 + (i - 3.5) * 0.35; o.allies.push({ x: P.x, y: P.y, vx: Math.cos(a) * 300, vy: Math.sin(a) * 300, hdg: a, cd: 0.4 + i * 0.05, tg: null, t: 0 }); }
+    const n = Math.max(2, 8 + m.count);
+    for (let i = 0; i < n; i++) { const a = -Math.PI / 2 + (i - (n - 1) / 2) * (2.8 / n); o.allies.push({ x: P.x, y: P.y, vx: Math.cos(a) * 300, vy: Math.sin(a) * 300, hdg: a, cd: 0.4 + i * 0.05, tg: null, t: 0, bomber: m.bombs, bd: 0.5 + i * 0.1 }); }
   }
   if (o.kind === 'bulwark') {
-    o.radius = Math.max(P.dv.width, P.dv.len) / 2 + 110;
+    o.radius = (Math.max(P.dv.width, P.dv.len) / 2 + 110) * m.width;
     for (const b of S.eb) if (!b.dead && b.kind !== 'beam' && b.kind !== 'strike' && Math.hypot(b.x - P.x, b.y - P.y) < 700) { b.dead = true; spark(b.x, b.y, '#4fd1e8', 2); }
-    for (const e of [...S.enemies]) if (!e.dead && Math.hypot(e.x - P.x, e.y - P.y) < 460 + e.r) damageTarget(e, 70 * (1 + 0.25 * (S.level - 1)));
-    if (S.boss?.alive && Math.hypot(S.boss.x - P.x, S.boss.y - P.y) < 460 + S.boss.r) damageBoss(120);
-    boomFx(P.x, P.y, 90, '#9ff3ff');
+    shockwave(460, 70, 120);
   }
   return true;
 }
+/** Bulwark shockwave: damages everything within r of the hull (boss: bossDmg), scaled by level and upgrades. */
+function shockwave(r: number, dmg: number, bossDmg: number) {
+  const P = S.P!, k = (1 + 0.25 * (S.level - 1)) * S.odm.dmg;
+  for (const e of [...S.enemies]) if (!e.dead && Math.hypot(e.x - P.x, e.y - P.y) < r + e.r) damageTarget(e, dmg * k);
+  if (S.boss?.alive && Math.hypot(S.boss.x - P.x, S.boss.y - P.y) < r + S.boss.r) damageBoss(bossDmg * S.odm.dmg);
+  boomFx(P.x, P.y, r * 0.2, '#9ff3ff');
+  addFx({ type: 'ring', x: P.x, y: P.y, life: 0.5, max: 0.5, size: r * 2, col: '#4fd1e8', h: 20, a: 0.9 });
+}
 function endOverdrive() {
   const o = S.overdrive; if (!o.active) return;
-  o.active = false; o.beam = null; o.radius = 0; o.allies = [];
+  o.active = false; o.beam = null; o.extra = []; o.radius = 0; o.allies = [];
   emit({ type: 'overdriveEnd', x: S.P?.x ?? 0, y: S.P?.y ?? 0, kind: o.kind });
 }
+/** Upgrade numbers: Sweep reach and speed, Twin Lance spacing, the fan's angle, Pulse cadence, Mend, Reflect. */
+export const OD_SWEEP = { reach: 300, speed: 380 } as const;
+/** Pierce: how far past the beam's edge the column burns aircraft (and, Skyburner, enemy fire). */
+export const OD_PIERCE = 64;
+export const OD_TWIN = { gap: 85, share: 0.6 } as const;
+export const OD_FAN = { step: 0.3, sweep: 0.35, len: 1150 } as const;
+export const OD_PULSE = { every: 1.5, r: 300, dmg: 35, boss: 60 } as const;
+export const OD_REFLECT = { speed: 640, dmg: 10, perFrame: 24 } as const;
+/** Distance from (px, py) to the segment (x1, y1)-(x2, y2), and how far along it (0..1) the nearest point lies. */
+function segDist(px: number, py: number, x1: number, y1: number, x2: number, y2: number) {
+  const dx = x2 - x1, dy = y2 - y1, L2 = dx * dx + dy * dy || 1, k = clamp(((px - x1) * dx + (py - y1) * dy) / L2, 0, 1);
+  return { d: Math.hypot(x1 + dx * k - px, y1 + dy * k - py), k };
+}
+/** One Ventral Lance burn tick at ground point (x, y), share s of the beam's damage. */
+function lanceBurn(x: number, y: number, w: number, s: number, lvl: number) {
+  const m = S.odm, R = w / 38;
+  groundBlast(x, y, 44 * R, 40 * lvl * m.dmg * s, true);
+  for (const e of S.enemies) if (!e.dead && e.layer === 'ground' && Math.hypot(e.x - x, e.y - y) < 50 * R + e.r) damageTarget(e, 16 * lvl * m.dmg * s);
+  // Pierce: the column runs up through the flight plane too
+  if (m.air) for (const e of S.enemies) if (!e.dead && e.layer === 'air' && Math.hypot(e.x - x, e.y - y) < w / 2 + OD_PIERCE + e.r) damageTarget(e, 16 * lvl * m.dmg * s * (m.skyburn ? 2 : 1));
+  if (m.skyburn) for (const b of S.eb) if (!b.dead && b.kind !== 'beam' && b.kind !== 'strike' && Math.hypot(b.x - x, b.y - y) < w / 2 + OD_PIERCE) { b.dead = true; spark(b.x, b.y, '#ffd27a', 2); }
+  S.overdrive.trail.push({ x: x + rnd(-6, 6), y: y + rnd(-4, 4), life: 6, max: 6 });
+  addFx({ type: 'fire', x: x + rnd(-14, 14) * R, y: y + rnd(-10, 10) * R, vx: rnd(-30, 30), vy: rnd(-30, 30), life: 0.7, max: 0.7, size: rnd(10, 18) * Math.sqrt(R), grow: 1.4, ground: true });
+  if (Math.random() < 0.4) addFx({ type: 'smoke', x, y, vx: rnd(-15, 15), vy: rnd(-15, 15), life: 2, max: 2, size: 12, grow: 2, a: 0.5, ground: true });
+}
+function updateLance(dt: number, lvl: number) {
+  const o = S.overdrive, P = S.P!, m = S.odm, w = 38 * m.width;
+  if (m.follow) {
+    // Sweep: the beam walks toward the reticle (a mouse pilot) or the nearest ground target, within reach of the keel
+    const tg = gunnery.manual ? aim : nearest(P.x, P.y, (e) => e.layer === 'ground' && !EN[e.type as EnemyType]?.salvage, OD_SWEEP.reach + 200);
+    let wx = tg ? tg.x - P.x : 0, wy = tg ? tg.y - P.y : 0; const wl = Math.hypot(wx, wy);
+    if (wl > OD_SWEEP.reach) { wx *= OD_SWEEP.reach / wl; wy *= OD_SWEEP.reach / wl; }
+    const dx = wx - o.off.x, dy = wy - o.off.y, dl = Math.hypot(dx, dy), st = Math.min(dl, OD_SWEEP.speed * dt);
+    if (dl > 0.01) { o.off.x += (dx / dl) * st; o.off.y += (dy / dl) * st; }
+  }
+  const gx = P.x + o.off.x, gy = P.y + o.off.y;
+  o.beam = { x1: P.x, y1: P.y, x2: gx, y2: gy, w, ground: true, col: OVERDRIVES.lance.col };
+  o.extra = m.twin ? [-1, 1].map((sd) => ({ x1: P.x + sd * OD_TWIN.gap, y1: P.y, x2: gx + sd * OD_TWIN.gap, y2: gy, w: w * 0.7, ground: true, col: OVERDRIVES.lance.col })) : [];
+  if (o.tick > 0) return;
+  o.tick = 0.05;
+  lanceBurn(gx, gy, w, 1, lvl);
+  for (const b of o.extra) lanceBurn(b.x2, b.y2, b.w, OD_TWIN.share, lvl);
+  // Burning Furrow: the scorch line keeps burning ground units that cross it (every third tick)
+  if (m.furrow && ++o.ticks % 3 === 0) {
+    for (const e of S.enemies) if (!e.dead && e.layer === 'ground' && o.trail.some((p) => p.life > 1.5 && Math.hypot(p.x - e.x, p.y - e.y) < 26 + e.r)) { damageTarget(e, 9 * lvl * m.dmg); if (Math.random() < 0.3) addFx({ type: 'fire', x: e.x, y: e.y, vx: 0, vy: 0, life: 0.5, max: 0.5, size: 10, grow: 1, ground: true }); }
+  }
+  // Molten spray and a dust front thrown out past the hull's silhouette, so the burn reads from above.
+  const R = Math.max(P.dv.width, P.dv.len) / 2;
+  for (let i = 0; i < 3; i++) {
+    const an = rnd(0, Math.PI * 2), sp = rnd(320, 640);
+    addFx({ type: 'spark', x: gx, y: gy, vx: Math.cos(an) * sp, vy: Math.sin(an) * sp, life: rnd(0.5, 0.9), max: 0.9, size: rnd(1.6, 2.6), drag: 1.3, ground: true, h: 4, vh: rnd(60, 200), grav: -320, tint: '#ffd27a' });
+  }
+  if (Math.random() < 0.6) { const an = rnd(0, Math.PI * 2); addFx({ type: 'dust', x: gx + Math.cos(an) * R * 0.8, y: gy + Math.sin(an) * R * 0.8, vx: Math.cos(an) * 140, vy: Math.sin(an) * 140, life: 1.1, max: 1.1, size: 18, grow: 2.4, drag: 1.6, a: 0.4, ground: true, h: 2, col: '#6a5d50', rot: rnd(0, 6.28) }); }
+  V.shake = Math.max(V.shake, 3);
+}
+/** Lance Spear beams this frame: the bow beam, a fan either side (Spear Fan), sweeping (Scythe), swelling (Hold). */
+function spearBeams(): OdBeam[] {
+  const o = S.overdrive, P = S.P!, m = S.odm, x = P.x, y = P.y - P.dv.len / 2, n = 1 + Math.max(0, m.count);
+  const grow = m.hold ? 0.6 + 1.4 * clamp(1 - o.t / Math.max(0.01, o.dur), 0, 1) : 1, w = 54 * m.width * grow;
+  const sw = m.sweep ? Math.sin(S.t * 2.2) * OD_FAN.sweep : 0, out: OdBeam[] = [];
+  for (let i = 0; i < n; i++) {
+    const a = -Math.PI / 2 + (i - (n - 1) / 2) * OD_FAN.step + sw;
+    out.push({ x1: x, y1: y, x2: x + Math.cos(a) * OD_FAN.len, y2: y + Math.sin(a) * OD_FAN.len, w, ground: false, col: OVERDRIVES.spear.col });
+  }
+  // the bow beam first
+  out.sort((p, q) => Math.abs(p.x2 - x) - Math.abs(q.x2 - x));
+  return out;
+}
+function updateSpear(lvl: number) {
+  const o = S.overdrive, m = S.odm, beams = spearBeams();
+  o.beam = beams[0]; o.extra = beams.slice(1);
+  if (o.tick > 0) return;
+  o.tick = 0.05;
+  for (const b of beams) {
+    for (const e of S.enemies) if (!e.dead && e.layer === 'air') { const h = segDist(e.x, e.y, b.x1, b.y1, b.x2, b.y2); if (h.k > 0 && h.d < b.w / 2 + e.r) damageTarget(e, 26 * lvl * m.dmg); }
+    const B = S.boss; if (B && B.alive && segDist(B.x, B.y, b.x1, b.y1, b.x2, b.y2).d < B.halfW) damageBoss(30 * lvl * m.dmg);
+    for (const s of S.eb) if (!s.dead && s.kind !== 'beam' && s.kind !== 'strike' && segDist(s.x, s.y, b.x1, b.y1, b.x2, b.y2).d < b.w / 2 + 6) s.dead = true;
+  }
+  V.shake = Math.max(V.shake, 4);
+}
+/** Nova: the spear column detonates along its length as it ends. */
+function spearFinale(lvl: number) {
+  for (const b of [S.overdrive.beam, ...S.overdrive.extra]) {
+    if (!b) continue;
+    const L = Math.hypot(b.x2 - b.x1, b.y2 - b.y1), n = Math.ceil(L / 90);
+    for (let i = 1; i <= n; i++) { const k = i / n, x = b.x1 + (b.x2 - b.x1) * k, y = b.y1 + (b.y2 - b.y1) * k; if (y < -40 || x < -40 || x > W + 40) break; later(i * 0.03, () => explode(x, y, 64, 45 * lvl * S.odm.dmg, 'air', OVERDRIVES.spear.col)); }
+  }
+  V.shake = Math.max(V.shake, 12); sfx('big', { x: S.P!.x, layer: 'ship' });
+}
+function updateWing(dt: number, lvl: number) {
+  const o = S.overdrive, P = S.P!, m = S.odm;
+  for (const a of o.allies) {
+    a.t += dt;
+    // Interceptors: guard the hull and kill shots near it; bombers: ground targets first; the rest hunt anything
+    let tg: Ent | null = null;
+    if (m.intercept) {
+      const reach = 90 * m.width;
+      let best: Ent | null = null, bd = (260 + reach) ** 2;
+      for (const b of S.eb) { if (b.dead || b.kind === 'beam' || b.kind === 'strike') continue; const d = (b.x - P.x) ** 2 + (b.y - P.y) ** 2; if (d < bd) { bd = d; best = b; } }
+      a.cd -= dt;
+      if (best && a.cd <= 0 && Math.hypot(best.x - a.x, best.y - a.y) < reach + 60) {
+        a.cd = 0.15; best.dead = true; S.beams.push({ x1: a.x, y1: a.y, x2: best.x, y2: best.y, col: '#9fd0ff', life: 0.1, max: 0.1, w: 1.5 }); spark(best.x, best.y, '#9fd0ff', 3);
+      }
+      tg = best ?? nearest(P.x, P.y, () => true, 420);
+    } else {
+      if (!a.tg || a.tg.dead) a.tg = a.bomber ? nearest(a.x, a.y, (e) => e.layer === 'ground' && !EN[e.type as EnemyType]?.salvage, 1400) ?? nearest(a.x, a.y, () => true, 1400) : nearest(a.x, a.y, () => true, 1400);
+      tg = a.tg;
+    }
+    const orbit = m.intercept && !tg;
+    const tx = tg ? tg.x : P.x + Math.cos(a.t * 2) * (orbit ? 160 : 200), ty = tg ? tg.y + (m.intercept ? 0 : 90) : P.y + (orbit ? Math.sin(a.t * 2) * 160 : -200);
+    const want = Math.atan2(ty - a.y, tx - a.x), na = a.hdg + clamp(angDiff(want, a.hdg), -5 * dt, 5 * dt);
+    const spd = a.bomber ? 380 : 520;
+    a.hdg = na; a.vx = Math.cos(na) * spd; a.vy = Math.sin(na) * spd; a.x += a.vx * dt; a.y += a.vy * dt;
+    if (m.intercept) { const dx = a.x - P.x, dy = a.y - P.y, dl = Math.hypot(dx, dy), lim = Math.max(P.dv.width, P.dv.len) / 2 + 260; if (dl > lim) { a.x = P.x + (dx / dl) * lim; a.y = P.y + (dy / dl) * lim; } continue; }
+    if (a.bomber && tg && tg.layer === 'ground') {
+      a.bd = (a.bd ?? 0) - dt;
+      if (a.bd <= 0 && Math.hypot(tg.x - a.x, tg.y - a.y) < 140) {
+        a.bd = 0.55; const life = 0.5, b = bolt(a.x, a.y, 0, 0, 30 * lvl * m.dmg, 'ground', '#f2a541', 4);
+        Object.assign(b, { kind: 'bomb', life, max: life, aoe: 60 * m.width, sx: a.x, sy: a.y, tx: tg.x + rnd(-10, 10), ty: tg.y + rnd(-10, 10) }); S.pb.push(b);
+        sfx('bombDrop', { x: a.x, layer: 'air' });
+      }
+      continue;
+    }
+    a.cd -= dt;
+    if (tg && a.cd <= 0 && Math.hypot(tg.x - a.x, tg.y - a.y) < 320) {
+      a.cd = a.bomber ? 0.4 : 0.22; const ang = Math.atan2(tg.y - a.y, tg.x - a.x);
+      S.pb.push(bolt(a.x, a.y, Math.cos(ang) * 800, Math.sin(ang) * 800, 9 * lvl * m.dmg, 'both', '#7fb6ff', 2.5));
+    }
+  }
+  // interceptors also gun what is near the hull
+  if (m.intercept) for (const a of o.allies) if (a.t % 0.3 < dt) { const e = nearest(a.x, a.y, (q) => q.layer !== 'ground', 300); if (e) { const ang = Math.atan2(e.y - a.y, e.x - a.x); S.pb.push(bolt(a.x, a.y, Math.cos(ang) * 800, Math.sin(ang) * 800, 9 * lvl * m.dmg, 'both', '#9fd0ff', 2.5)); } }
+}
+function updateBulwark(dt: number) {
+  const o = S.overdrive, P = S.P!, m = S.odm, lvl = 1 + 0.25 * (S.level - 1);
+  let thrown = 0;
+  for (const b of S.eb) if (!b.dead && b.kind !== 'beam' && b.kind !== 'strike' && Math.hypot(b.x - P.x, b.y - P.y) < o.radius) {
+    b.dead = true; spark(b.x, b.y, '#4fd1e8', 3);
+    // Reflect: the shot goes back the way it came, as ours
+    if (m.reflect && thrown++ < OD_REFLECT.perFrame) {
+      const a = Math.atan2(-(b.vy || 1), -(b.vx || 0));
+      S.pb.push(bolt(b.x, b.y, Math.cos(a) * OD_REFLECT.speed, Math.sin(a) * OD_REFLECT.speed, OD_REFLECT.dmg * lvl * m.dmg, 'both', '#9ff3ff', 3.5));
+    }
+  }
+  if (m.mend) { P.hp = Math.min(P.dv.maxHp, P.hp + P.dv.maxHp * m.mend * S.heat.heal * dt); if (Math.random() < dt * 12) spark(P.x + rnd(-P.dv.width / 2, P.dv.width / 2), P.y + rnd(-P.dv.len / 2, P.dv.len / 2), '#8fe39a', 2); }
+  if (m.pulse) { o.pulseT -= dt; if (o.pulseT <= 0) { o.pulseT = OD_PULSE.every; shockwave(OD_PULSE.r, OD_PULSE.dmg, OD_PULSE.boss); sfx('shield', { x: P.x, layer: 'ship' }); V.shake = Math.max(V.shake, 5); } }
+}
 function updateOverdrive(dt: number) {
-  const o = S.overdrive, P = S.P!;
+  const o = S.overdrive;
   for (const p of o.trail) { p.life -= dt; p.y += S.scroll * dt; }
   o.trail = o.trail.filter((p) => p.life > 0 && p.y < H + 60);
   if (keys.od) { keys.od = false; triggerOverdrive(); }
   if (!o.active) return;
   o.t -= dt; o.tick -= dt;
   const lvl = 1 + 0.25 * (S.level - 1);
-  if (o.kind === 'lance') {
-    o.beam = { x1: P.x, y1: P.y, x2: P.x, y2: P.y, w: 38, ground: true, col: OVERDRIVES.lance.col };
-    if (o.tick <= 0) {
-      o.tick = 0.05;
-      groundBlast(P.x, P.y, 44, 40 * lvl, true);
-      for (const e of S.enemies) if (!e.dead && e.layer === 'ground' && Math.hypot(e.x - P.x, e.y - P.y) < 50 + e.r) damageTarget(e, 16 * lvl);
-      o.trail.push({ x: P.x + rnd(-6, 6), y: P.y + rnd(-4, 4), life: 6, max: 6 });
-      addFx({ type: 'fire', x: P.x + rnd(-14, 14), y: P.y + rnd(-10, 10), vx: rnd(-30, 30), vy: rnd(-30, 30), life: 0.7, max: 0.7, size: rnd(10, 18), grow: 1.4, ground: true });
-      if (Math.random() < 0.4) addFx({ type: 'smoke', x: P.x, y: P.y, vx: rnd(-15, 15), vy: rnd(-15, 15), life: 2, max: 2, size: 12, grow: 2, a: 0.5, ground: true });
-      // Molten spray and a dust front thrown out past the hull's silhouette, so the burn reads from above.
-      const R = Math.max(P.dv.width, P.dv.len) / 2;
-      for (let i = 0; i < 3; i++) {
-        const an = rnd(0, Math.PI * 2), sp = rnd(320, 640);
-        addFx({ type: 'spark', x: P.x, y: P.y, vx: Math.cos(an) * sp, vy: Math.sin(an) * sp, life: rnd(0.5, 0.9), max: 0.9, size: rnd(1.6, 2.6), drag: 1.3, ground: true, h: 4, vh: rnd(60, 200), grav: -320, tint: '#ffd27a' });
-      }
-      if (Math.random() < 0.6) { const an = rnd(0, Math.PI * 2); addFx({ type: 'dust', x: P.x + Math.cos(an) * R * 0.8, y: P.y + Math.sin(an) * R * 0.8, vx: Math.cos(an) * 140, vy: Math.sin(an) * 140, life: 1.1, max: 1.1, size: 18, grow: 2.4, drag: 1.6, a: 0.4, ground: true, h: 2, col: '#6a5d50', rot: rnd(0, 6.28) }); }
-      V.shake = Math.max(V.shake, 3);
-    }
-  } else if (o.kind === 'spear') {
-    const x = P.x, y = P.y - P.dv.len / 2, w = 54;
-    o.beam = { x1: x, y1: y, x2: x, y2: -60, w, ground: false, col: OVERDRIVES.spear.col };
-    if (o.tick <= 0) {
-      o.tick = 0.05;
-      for (const e of S.enemies) if (!e.dead && e.layer === 'air' && e.y < y && Math.abs(e.x - x) < w / 2 + e.r) damageTarget(e, 26 * lvl);
-      const B = S.boss; if (B && B.alive && B.y < y && Math.abs(B.x - x) < B.halfW) damageBoss(30 * lvl);
-      for (const b of S.eb) if (!b.dead && b.kind !== 'beam' && b.kind !== 'strike' && b.y < y && Math.abs(b.x - x) < w / 2 + 6) b.dead = true;
-      V.shake = Math.max(V.shake, 4);
-    }
-  } else if (o.kind === 'wing') {
-    for (const a of o.allies) {
-      a.t += dt;
-      if (!a.tg || a.tg.dead) a.tg = nearest(a.x, a.y, () => true, 1400);
-      const tx = a.tg ? a.tg.x : P.x + Math.cos(a.t * 2) * 200, ty = a.tg ? a.tg.y + 90 : P.y - 200;
-      const want = Math.atan2(ty - a.y, tx - a.x), na = a.hdg + clamp(angDiff(want, a.hdg), -5 * dt, 5 * dt);
-      a.hdg = na; a.vx = Math.cos(na) * 520; a.vy = Math.sin(na) * 520; a.x += a.vx * dt; a.y += a.vy * dt;
-      a.cd -= dt;
-      if (a.tg && a.cd <= 0 && Math.hypot(a.tg.x - a.x, a.tg.y - a.y) < 320) {
-        a.cd = 0.22; const ang = Math.atan2(a.tg.y - a.y, a.tg.x - a.x);
-        S.pb.push(bolt(a.x, a.y, Math.cos(ang) * 800, Math.sin(ang) * 800, 9 * lvl, 'both', '#7fb6ff', 2.5));
-      }
-    }
-  } else if (o.kind === 'bulwark') {
-    for (const b of S.eb) if (!b.dead && b.kind !== 'beam' && b.kind !== 'strike' && Math.hypot(b.x - P.x, b.y - P.y) < o.radius) { b.dead = true; spark(b.x, b.y, '#4fd1e8', 3); }
-  }
-  if (o.t <= 0) endOverdrive();
+  if (o.kind === 'lance') updateLance(dt, lvl);
+  else if (o.kind === 'spear') updateSpear(lvl);
+  else if (o.kind === 'wing') updateWing(dt, lvl);
+  else if (o.kind === 'bulwark') updateBulwark(dt);
+  if (o.t <= 0) { if (o.kind === 'spear' && S.odm.finale) spearFinale(lvl); endOverdrive(); }
 }
 
 /* ---------------- gunnery: AUTO batteries and manually aimed HEAVY groups ---------------- */
@@ -1350,13 +1477,14 @@ function updateCrawler(e: Enemy, dt: number, fire: boolean) {
   }
   e.cd3 -= dt; if (e.cd3 <= 0) { e.cd3 = 6; for (let i = 0; i < 5; i++) spawnEnemy('infantry', e.x + rnd(-40, 40), e.y + 30 + rnd(0, 10)); spawnEnemy('tank', e.x + pick([-60, 60]), e.y + 20, { vx: rnd(-20, 20) }); }
 }
-/** Drone carrier: holds the top of the field, launching drone waves and sweeping a slow fan that the hull must weather. */
+/** Drone carrier: holds the top of the field, launching drone waves (every 4.6 s) and sweeping a slow fan (every 3.3 s)
+ *  that the hull must weather. */
 function updateCarrier(e: Enemy, dt: number, fire: boolean) {
   const rage = elitePhase(e);
   if (e.y < e.hoverY) e.y += 50 * dt; else e.x = W / 2 + Math.sin(e.t * 0.25) * 420;
   if (!fire) return;
-  if (e.cd <= 0) { e.cd = 4 / rage; for (let i = 0; i < 4; i++) spawnEnemy('drone', e.x + (i - 1.5) * 30, e.y + 20, { baseX: clamp(e.x + (i - 1.5) * 60, 80, W - 80), phase: i }); }
-  e.cd2 -= dt; if (e.cd2 <= 0) { e.cd2 = 2.8 / rage; const n = 11, off = Math.sin(e.t) * 0.3; for (let i = 0; i < n; i++) eShot(e.x, e.y + 30, Math.PI / 2 + off + (i - (n - 1) / 2) * 0.15, bspd() * 0.75, { col: '#ff7a6b' }); }
+  if (e.cd <= 0) { e.cd = 4.6 / rage; for (let i = 0; i < 4; i++) spawnEnemy('drone', e.x + (i - 1.5) * 30, e.y + 20, { baseX: clamp(e.x + (i - 1.5) * 60, 80, W - 80), phase: i }); }
+  e.cd2 -= dt; if (e.cd2 <= 0) { e.cd2 = 3.3 / rage; const n = 11, off = Math.sin(e.t) * 0.3; for (let i = 0; i < n; i++) eShot(e.x, e.y + 30, Math.PI / 2 + off + (i - (n - 1) / 2) * 0.15, bspd() * 0.75, { col: '#ff7a6b' }); }
   e.cd3 -= dt; if (e.cd3 <= 0) { e.cd3 = 5; for (const s of [-1, 1]) eShot(e.x + s * 40, e.y, Math.PI / 2 + s * 0.9, 130, { kind: 'missile', turn: 1.8, spd: 160, hp: 6 * hpMult(), life: 5, r: 5, col: '#ff9f5a', dmg: edmg() * 2 }); }
 }
 function updateEB(dt: number) {
@@ -1422,7 +1550,7 @@ export function shipHit(x: number, y: number, r: number, sx: number, sy: number,
 export let onScrap: (v: number) => void = () => {};
 export const setScrapHandler = (f: (v: number) => void) => { onScrap = f; };
 function updatePickups(dt: number) {
-  const P = S.P!, vac = S.mode === 'clear' || S.mode === 'bossdown' || hasFlag(S.relics, 'vacuum');
+  const P = S.P!, vac = S.mode === 'clear' || S.mode === 'bossdown' || hasFlag(S.relics, 'vacuum') || (S.overdrive.active && S.odm.vacuum);
   S.pickStreak.t += dt; if (S.pickStreak.t > 0.5) S.pickStreak.n = 0;
   const reach = P.dv.magnet, alive = S.mode !== 'dying';
   for (const p of S.pickups) {

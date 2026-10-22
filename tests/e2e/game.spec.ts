@@ -141,7 +141,7 @@ test('refit board: drag to equip, swap mounts, unmount, reorder sections, keyboa
   // Sections: drag the engine block forward of the battery.
   await drag(page, 'li.sec[data-sec="2"] .sec-nm', 'li.sec[data-sec="1"]');
   expect(await gd<string>(page, "g.run.build.sections.map(s => s.type).join(',')")).toBe('bridge,engine,battery');
-  expect(await page.evaluate(() => localStorage.getItem('gd.run.v3') ?? '')).toContain('"engine"');
+  expect(await page.evaluate(() => localStorage.getItem('gd.run.v4') ?? '')).toContain('"engine"');
   await page.screenshot({ path: `${SHOTS}/17-refit-after.png` });
   await page.click('#btn-done');
   await expect(page.locator('svg[aria-label^="Sector"]')).toBeVisible();

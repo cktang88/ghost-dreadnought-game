@@ -16,8 +16,10 @@ import { settings as uiSettings, onSettings } from './ui/settings';
 import { wireAudioSettings } from './ui/sound';
 import {
   newRun, loadRun, saveRun, clearSave, maxHp, dv, mods, level, bossLevel, heal, healAmount, repairQuote, buyRepair, partChoices, relicChoices, addRelic, addSection,
-  nextSectionCost, enterNextSector, deathGhost, changeBuild, runRng, floorOf, type RunState,
+  nextSectionCost, enterNextSector, deathGhost, changeBuild, runRng, floorOf, takeOd, type RunState,
 } from './game/run';
+import { odTreeView } from './ui/screens/odTree';
+import { OD_NODE, openOdNodes } from './data/overdriveTree';
 import { NODE_INFO, reachable, type NodeType } from './game/map';
 import { fetchGhosts, submitGhost, chooseGhost, aiGhost, registryOnline, sanitizeName, type Ghost } from './game/ghosts';
 import { FIGHTS, ELITES, BOSS_ENCOUNTER, type Encounter, type EnemyType } from './data/enemies';
@@ -40,7 +42,7 @@ import { loadProfile, perksFor, dailySeed, utcDateKey, type Profile, type Settle
 import { filingFor, submitDaily, fetchDailyBoard, flushPendingDaily } from './game/daily';
 import { roster, localRow, dailyBriefing } from './ui/screens/roster';
 import { launchPanel, admiraltyScreen, settle, victoryScreen, portScreen } from './game/metaScreens';
-import { HULLS } from './data/hulls';
+import { HULLS, OVERDRIVES } from './data/hulls';
 import { heatFx } from './data/heat';
 import { CAMPAIGN_SECTORS } from './game/run';
 
@@ -87,7 +89,7 @@ let mode: 'title' | 'menu' | 'combat' = 'title';
 let paused = false;
 let onCombatDone: ((o: 'win' | 'dead') => void) | null = null;
 let sectorGhosts: Ghost[] = [];
-let mapToast = '';
+let mapToast = '', mapToastOd = '';
 const debug = { timeScale: 1 };
 
 /* ---------------- input ---------------- */
@@ -285,7 +287,7 @@ function mapScreen() {
   };
   const chart = mapView(r.map, r.at, r.visited, travel, setInfo, r.callsign);
   const toast = mapToast; mapToast = '';
-  show(mapScreenView({ run: r, chart, toast, readout: readout.el, intel: intelCard(), onRefit: refitScreen, onMenu: abandonPrompt }));
+  show(mapScreenView({ run: r, chart, toast, readout: readout.el, intel: intelCard(), onRefit: refitScreen, onMenu: abandonPrompt, onTree: () => odTreeScreen('chart room', null, mapScreen) }));
   const cur = chart.querySelector('.node.reach') as SVGGElement | null;
   if (cur && chart.classList.contains('wide') === false) requestAnimationFrame(() => cur.scrollIntoView({ block: 'center' }));
 }
@@ -293,6 +295,24 @@ function abandonPrompt() {
   show(runMenuView({ run: run!, onBack: mapScreen, onQuit: titleScreen, onAbandon: abandonRun }));
 }
 function abandonRun() { if (run) settle(profile, run, 'abandoned'); clearSave(); run = null; endCombat(); mode = 'title'; titleScreen(); }
+/**
+ * The Overdrive refit tree. `priceMul` null: only banked commissions can be spent (from the map); otherwise scrap
+ * buys refits at that markup. `once`: leave after one refit (the drydock's single job).
+ */
+function odTreeScreen(where: string, priceMul: number | null, back: () => void, opts: { once?: (msg: string) => void; backLabel?: string } = {}) {
+  const r = run!;
+  const render = (fresh?: string) => show(odTreeView({
+    run: r, priceMul, where, fresh, backLabel: opts.backLabel ?? 'Done', onBack: back,
+    onTake: (id) => {
+      const got = takeOd(r, id, priceMul ?? 1); if (!got) { sfx('uiError'); return; }
+      sfx('buy'); saveRun(r);
+      const msg = `${OD_NODE[id].name} fitted to the ${OVERDRIVES[HULLS[r.hull].overdrive].name}${got.credit ? ' on commission' : ` for ${got.cost} scrap`}.`;
+      if (opts.once) { opts.once(msg); return; }
+      render(id);
+    },
+  }));
+  render();
+}
 function refitScreen() {
   const r = run!;
   show(refitView({ run: r, back: { label: 'Done', id: 'btn-done', act: mapScreen }, onChange: () => saveRun(r) }));
@@ -323,7 +343,7 @@ function fight(enc: Encounter, after: () => void, ghost?: Ghost) {
   setScrapHandler((v) => { r.scrap += v; r.stats.scrapEarned += v; });
   startCombat({
     enc, level: enc.kind === 'boss' ? bossLevel(r) : level(r, enc.kind === 'elite'), sector: r.sector, build: r.build, hp: r.hp, relics: r.relics, mods: mods(r), ghost, cheatDeathAvailable: !r.jumpUsed,
-    overdrive: HULLS[r.hull].overdrive, heat: heatFx(r.heat), odCharge: r.odStart,
+    overdrive: HULLS[r.hull].overdrive, heat: heatFx(r.heat), odCharge: r.odStart, odTree: r.od,
     floor: enc.kind === 'boss' ? 10 : floorOf(r), seed: r.seed,
   });
   onCombatDone = (o) => {
@@ -410,6 +430,8 @@ function merchantScreen() {
         ...(curses.length ? [{ icon: 'radioactive', label: `Purge ${RELICS[curses[0]].name} · 75 scrap`, disabled: r.scrap < 75,
           act: () => { r.scrap -= 75; changeBuild(r, () => r.relics.splice(r.relics.indexOf(curses[0]), 1)); toast = `${RELICS[curses[0]].name} purged.`; saveRun(r); render(); } }] : []),
         { icon: 'wrench', label: 'Refit ship', disabled: false, act: () => refitFromMerchant() },
+        { icon: 'power-lightning', label: `Overdrive refit${r.odCredits ? ` · ${r.odCredits} commission${r.odCredits > 1 ? 's' : ''}` : ''}`, disabled: !openOdNodes(HULLS[r.hull].overdrive, r.od).length,
+          act: () => odTreeScreen('quartermaster', m(), () => { toast = 'The quartermaster files the refit papers.'; render(); }) },
       ],
       sell: r.inv.map((p, i) => ({ part: p, value: Math.floor(partCost(p) * 0.4), act: () => { const v = Math.floor(partCost(p) * 0.4); r.scrap += v; r.inv.splice(i, 1); sfx('buy'); toast = `Sold ${partName(p)} for ${v} scrap.`; saveRun(r); render(); } })),
       onLeave: () => { saveRun(r); mapScreen(); },
@@ -450,8 +472,12 @@ function drydockScreen() {
     const parts = [...allParts(r.build), ...r.inv].filter((p) => p.tier < 5);
     show(upgradeView({ run: r, onBack: drydockScreen, parts: parts.map((p) => ({ part: { ...p, tier: p.tier + 1 }, from: p.tier, act: () => { changeBuild(r, () => { p.tier++; }); done(`${partName(p)} upgraded.`); } })) }));
   };
+  const odOpen = openOdNodes(HULLS[r.hull].overdrive, r.od);
   show(drydockView({
     run: r, healAmt, canRepair: r.hp < maxHp(r),
+    overdrive: { name: OVERDRIVES[HULLS[r.hull].overdrive].name, disabled: !odOpen.length,
+      detail: odOpen.length ? `Fit one refit from the upgrade tree${r.odCredits ? ' (a commission is banked)' : `, from ${Math.min(...odOpen.map((x) => x.cost))} scrap`}.` : 'Every tier is fitted.',
+      act: () => odTreeScreen('drydock', 1, drydockScreen, { once: done, backLabel: 'Back to the work order' }) },
     onRepair: () => { const a = heal(r, 0.35); done(`Repaired ${Math.round(a)} hull${r.heat >= 8 ? ' (No Quarter)' : ''}.`); },
     onUpgrade: upgradeList,
     welds: offer.map((k) => ({ name: SECTIONS[k].name, type: k, disabled: r.build.sections.length >= 8,
@@ -475,7 +501,8 @@ async function bossNode() {
   const r = run!;
   if (!r.bossGhost) { show(holdView(r, 'Scanning wrecks…')); await ensureIntel(); }
   const g = r.bossGhost ?? aiGhost(r.sector);
-  fight(BOSS_ENCOUNTER, () => { r.stats.bosses++; bossReward(g); }, g);
+  // every sector boss banks a free Overdrive commission (spent on the tree right after the trophy, or later)
+  fight(BOSS_ENCOUNTER, () => { r.stats.bosses++; r.odCredits++; saveRun(r); bossReward(g); }, g);
 }
 function bossReward(g: Ghost) {
   const r = run!;
@@ -493,10 +520,19 @@ function bossReward(g: Ghost) {
   };
   const next = (id: string | null) => {
     if (id) addRelic(r, id);
+    // the boss's commission: the Overdrive tree opens before the next sector (Continue banks it if nothing is open)
+    if (r.odCredits > 0 && openOdNodes(HULLS[r.hull].overdrive, r.od).length) {
+      odTreeScreen('commission', null, () => proceed(), { once: (msg) => { mapToastOd = msg; proceed(); }, backLabel: 'Bank it and continue' });
+      return;
+    }
+    proceed();
+  };
+  const proceed = () => {
     const patched = heal(r, 0.3);
     if (r.sector >= CAMPAIGN_SECTORS && !r.won) { r.won = true; r.phase = 'victory'; saveRun(r); showVictory(); return; }
     enterNextSector(r); sectorGhosts = [];
-    mapToast = patched >= 1 ? `Sector ${r.sector}. Crews patched ${Math.round(patched)} hull on the way in.` : `Sector ${r.sector}. The hull is whole; the crews rest on the way in.`;
+    mapToast = (patched >= 1 ? `Sector ${r.sector}. Crews patched ${Math.round(patched)} hull on the way in.` : `Sector ${r.sector}. The hull is whole; the crews rest on the way in.`) + (mapToastOd ? ` ${mapToastOd}` : '');
+    mapToastOd = '';
     saveRun(r); mapScreen();
   };
   render();

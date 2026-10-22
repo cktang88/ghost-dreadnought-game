@@ -1040,3 +1040,39 @@ ol.heat-list li.shut { opacity: .5; }
 .slip .ds.place { flex: 0; font-size: 12px; font-family: var(--f-mono); letter-spacing: .02em; color: #5a5242; border-top: 1px dashed rgba(58, 53, 40, .35); padding-top: 4px; }
 .slip em.layer.ctl.heavy { color: #8d520a; } .slip em.layer.ctl.auto { color: #275f31; }
 em.layer.ctl.heavy { color: var(--hazard); } em.layer.ctl.auto { color: var(--good); }
+
+/* ==================== Overdrive refit tree (src/ui/screens/odTree.ts) ====================
+   An engineering schematic on steel: one column per path, refit plates joined by conduit, a CRT preview.
+   Self-contained block; every class is prefixed od-. */
+.odtree .od-ledger { display: flex; flex-wrap: wrap; gap: 10px 26px; align-items: center; margin: 10px 0 4px; }
+.odtree .od-cell { display: flex; align-items: center; gap: 10px; }
+.odtree .od-lamps { display: inline-flex; align-items: center; gap: 5px; }
+.odtree .od-lamps b { margin-left: 6px; color: var(--fg); }
+.od-tree { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; margin-top: 10px; }
+.od-path { display: flex; flex-direction: column; align-items: stretch; gap: 0; padding: 12px; background: var(--hull); box-shadow: inset 0 0 0 1px var(--seam), inset 0 0 0 2px var(--edge); }
+.od-path.od-path-locked { opacity: .5; filter: saturate(.4); }
+.od-path.od-path-taken { box-shadow: inset 0 0 0 1px var(--seam), inset 0 0 0 2px var(--od, var(--hazard)); }
+.od-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.od-link { display: block; width: 4px; height: 16px; margin: 0 auto; background: repeating-linear-gradient(var(--edge-hi) 0 4px, transparent 4px 7px); }
+.od-path-taken .od-link { background: var(--od, var(--hazard)); box-shadow: 0 0 8px var(--od, var(--hazard)); }
+.od-node { position: relative; display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 9px 10px 10px; font: inherit; text-align: left; text-transform: none; letter-spacing: 0; color: var(--fg); background: var(--hull-2); border: 0; box-shadow: inset 0 0 0 1px var(--seam), inset 3px 0 0 var(--edge-hi); cursor: default; }
+.od-node .od-tier { font-family: var(--f-mono); font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--faint); }
+.od-node .od-name { font-family: var(--f-stencil); font-size: 16px; letter-spacing: .04em; color: var(--fg); }
+.od-node .od-desc { font-size: 13px; line-height: 1.3; color: var(--dim); }
+.od-node .od-cost { margin-top: auto; padding-top: 4px; font-family: var(--f-mono); font-size: 12px; color: var(--faint); border-top: 1px dashed var(--edge); }
+.od-node .od-cost .price { display: inline-flex; align-items: center; gap: 4px; color: var(--scrap); }
+.od-node .od-cost .ico { width: 14px; height: 14px; }
+.od-node.od-open { box-shadow: inset 0 0 0 1px var(--seam), inset 3px 0 0 var(--od, var(--hazard)); }
+.od-node.od-open .od-cost { color: var(--fg); }
+.od-node.od-buy { cursor: pointer; }
+.od-node.od-buy:hover, .od-node.od-buy:focus-visible { background: var(--hull-3); box-shadow: inset 0 0 0 1px var(--seam), inset 3px 0 0 var(--od, var(--hazard)), 0 0 0 2px var(--od, var(--hazard)); outline: 0; }
+.od-node.od-taken { background: linear-gradient(180deg, rgba(255, 255, 255, .04), transparent), var(--hull-3); box-shadow: inset 0 0 0 1px var(--seam), inset 0 0 0 2px var(--od, var(--hazard)), 0 0 14px -4px var(--od, var(--hazard)); }
+.od-node.od-taken .od-name { color: var(--od, var(--hazard)); }
+.od-node.od-locked { opacity: .55; }
+.od-node.od-later { opacity: .8; }
+.od-node .stamp { position: absolute; right: 6px; top: 6px; transform: rotate(-8deg) scale(.7); transform-origin: top right; }
+.odtree .od-preview { margin-top: 14px; min-height: 64px; }
+.odtree .od-preview-text { margin: 0; font-size: 14px; line-height: 1.4; }
+#btn-od-tree.od-due { box-shadow: 0 0 0 2px var(--hazard); }
+#btn-od-tree .od-badge { display: inline-grid; place-items: center; min-width: 18px; height: 18px; margin-left: 6px; padding: 0 4px; font-family: var(--f-mono); font-size: 12px; color: var(--hazard-ink); background: var(--hazard); }
+@media (max-width: 640px) { .od-pair { grid-template-columns: 1fr; } }
