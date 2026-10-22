@@ -6,8 +6,10 @@
 //
 // Turret yaw in the renderer is the three.js rotation about +Y: 0 points at the bow, +PI/2 to PORT. So
 // yaw = -(ship angle).
-import { WEAPONS, clampTraverse, fieldToShip, inTraverse, type Mount, type SectionType, type Traverse as GameTraverse } from '../../data/parts';
+import { WEAPONS, clampTraverse, facingAngle, fieldToShip, inTraverse, type Mount, type SectionType, type Traverse as GameTraverse } from '../../data/parts';
 import { has } from '../../util/rng';
+
+const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
 
 export type MountKind = 'dorsal' | 'bow' | 'side' | 'ventral' | 'omni';
 export interface Traverse {
@@ -22,23 +24,40 @@ export interface Traverse {
   elev: number;
   /** The shared traverse (sectors in ship space). */
   game: GameTraverse;
+  /**
+   * Slew range in ship space relative to the facing (`face`, ship radians): the gun turns only inside
+   * [face + lo, face + hi], never across the back of its arc, but it may swing past bearings the hull
+   * masks (towers block fire, not training). `free` turrets turn all round.
+   */
+  face: number; lo: number; hi: number; free: boolean;
 }
 
 const FREE: GameTraverse = { arc: 'dorsal', sectors: [{ c: 0, h: Math.PI }], layers: 'air', down: false, blocked: [] };
 
+/** Clamp a ship angle into the nearest sector. */
+function intoSectors(ss: GameTraverse['sectors'], a: number) {
+  let best = a, bd = Infinity;
+  for (const s of ss) { const d = wrap(a - s.c), k = Math.max(-s.h, Math.min(s.h, d)), off = Math.abs(d - k); if (off < bd) { bd = off; best = s.c + k; } }
+  return wrap(best);
+}
+
 export function mountTraverse(m: Mount, _section?: SectionType): Traverse {
   const id = m.part?.id ?? '', g = m.trav ?? FREE;
   const half = g.sectors.reduce((a, s) => Math.max(a, s.h), 0);
-  const layer = g.layers === 'shots' || g.layers === 'none' ? 'none' : g.layers;
-  // A battery's centre gun covers both beams: it rests fore and aft, so dress it as a centreline turret.
-  const center = g.sectors.length === 1 ? -g.sectors[0].c : 0;
-  if (!has(WEAPONS, id)) return { kind: 'dorsal', center: 0, half: 0, layer: 'none', elev: 0, game: g };
-  if (id === 'bomb') return { kind: 'ventral', center: 0, half: 0, layer, elev: 0, game: g };
-  if (id === 'artillery') return { kind: 'ventral', center: 0, half, layer, elev: 0.85, game: g };
-  if (g.arc === 'omni') return { kind: 'omni', center, half, layer, elev: id === 'pd' ? 0.5 : 0, game: g };
-  if (g.arc === 'broadside') return m.side ? { kind: 'side', center, half, layer, elev: -0.2, game: g } : { kind: 'dorsal', center, half, layer, elev: 0.15, game: g };
-  if (g.arc === 'bow') return { kind: 'bow', center, half, layer, elev: -0.1, game: g };
-  return { kind: 'dorsal', center, half, layer, elev: 0.5, game: g };
+  const layer: Traverse['layer'] = g.layers === 'shots' || g.layers === 'none' ? 'none' : g.layers;
+  const free = g.sectors.some((s) => s.h >= Math.PI - 1e-6) || g.down || g.arc === 'omni';
+  // Rest on the mount's facing, or the nearest bearing the hull leaves open when the facing itself is masked.
+  const face = free ? 0 : facingAngle(m.facing ?? 0), rest = free ? 0 : intoSectors(g.sectors, face);
+  let lo = 0, hi = 0;
+  for (const s of g.sectors) { const r = wrap(s.c - face); lo = Math.min(lo, r - s.h); hi = Math.max(hi, r + s.h); }
+  const base = { center: -rest, half, layer, game: g, face, lo: Math.max(-Math.PI, lo), hi: Math.min(Math.PI, hi), free };
+  if (!has(WEAPONS, id)) return { ...base, kind: 'dorsal', center: 0, half: 0, layer: 'none', elev: 0, free: true };
+  if (id === 'bomb') return { ...base, kind: 'ventral', center: 0, half: 0, elev: 0, free: true };
+  if (id === 'artillery') return { ...base, kind: 'ventral', center: 0, elev: 0.85, free: true };
+  if (g.arc === 'omni') return { ...base, kind: 'omni', center: 0, elev: id === 'pd' ? 0.5 : 0, free: true };
+  if (g.arc === 'broadside') return { ...base, kind: m.side ? 'side' : 'dorsal', elev: m.side ? -0.2 : 0.15 };
+  if (g.arc === 'bow') return { ...base, kind: 'bow', elev: -0.1 };
+  return { ...base, kind: 'dorsal', elev: 0.5 };
 }
 
 /**
@@ -52,19 +71,22 @@ export function aimYaw(t: Traverse, fieldAngle: number, mirrored: boolean, cur: 
   if (off > 0.5) return restYaw(t, cur);
   return -fieldToShip(c, mirrored);
 }
-/** Rest: the centre of the sector nearest the current yaw (two-sector guns stay on their last beam). */
-export function restYaw(t: Traverse, cur: number) {
-  const ss = t.game.sectors; if (ss.length < 2) return t.center;
-  let best = t.center, bd = Infinity;
-  for (const s of ss) { const d = Math.abs(Math.atan2(Math.sin(-s.c - cur), Math.cos(-s.c - cur))); if (d < bd) { bd = d; best = -s.c; } }
-  return best;
-}
-/** Keep a renderer yaw inside the traverse (ship space, so mirroring does not matter). */
+/** Rest: the mount's facing (clamped into an open sector). */
+export function restYaw(t: Traverse, _cur?: number) { return t.center; }
+/** Renderer yaw as an offset from the facing, in ship radians (inside the slew range when the gun is). */
+const rel = (t: Traverse, yaw: number) => wrap(-yaw - t.face);
+/** Keep a renderer yaw inside the slew range (ship space, so mirroring does not matter). */
 export function holdYaw(t: Traverse, yaw: number) {
-  const ss = t.game.sectors; if (!ss.length || t.half >= Math.PI) return yaw;
-  const a = -yaw; let best = a, bd = Infinity;
-  for (const s of ss) { const d = Math.atan2(Math.sin(a - s.c), Math.cos(a - s.c)), k = Math.max(-s.h, Math.min(s.h, d)), off = Math.abs(d - k); if (off < bd) { bd = off; best = s.c + k; } }
-  return -best;
+  if (t.free) return yaw;
+  return -(t.face + Math.max(t.lo, Math.min(t.hi, rel(t, yaw))));
+}
+/**
+ * Yaw change from `cur` toward `want` the way the gun can actually turn: the short way for free turrets,
+ * otherwise inside its own arc (never across the back of it, through its stops).
+ */
+export function slewDelta(t: Traverse, cur: number, want: number) {
+  if (t.free) return wrap(want - cur);
+  return -(rel(t, want) - rel(t, cur));
 }
 /** Is a field bearing inside the traverse? (player side, unmirrored) */
 export const bearingIn = (t: Traverse, fieldAngle: number) => !t.game.sectors.length || inTraverse(t.game, fieldAngle, false);
