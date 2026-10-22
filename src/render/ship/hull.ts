@@ -375,6 +375,18 @@ function strut(c: Ctx, a: V3, b: V3, r: number, seg = 6) {
 }
 /** Plan rect of an obstacle in body space (hullObstacles works in field units). */
 interface OBox { x0: number; x1: number; z0: number; z1: number }
+/**
+ * The structures to model from the rules' obstacles: towers and funnels as they are; a battery's hull box becomes its two
+ * sponsons (the casemates outboard of the hull beam); other modules' hull boxes are plain hull, not structures.
+ */
+function drawnObstacles(dv: Derived): Obstacle[] {
+  return dv.obstacles.flatMap((o): Obstacle[] => {
+    if (o.kind === 'tower') return [o];
+    if (o.by !== 'battery') return [];
+    const hw = (o.hw * 2 - HULL_BEAM * SHIP_SCALE) / 2 + 2 * SHIP_SCALE;
+    return [-1, 1].map((sd) => ({ ...o, x: o.x + sd * (o.hw - hw), hw }));
+  });
+}
 const obox = (o: Obstacle, ik: number): OBox => ({ x0: (o.x - o.hw) * ik, x1: (o.x + o.hw) * ik, z0: (o.y - o.hl) * ik, z1: (o.y + o.hl) * ik });
 
 /** Forecastle on the prow: breakwater, anchor gear, hull number and the jackstaff. */
@@ -674,7 +686,7 @@ export function buildShip(dv: Derived, L: Livery, sigText: string, callsign = ''
   const secRng = (i: number, salt = 0) => mulberry32(hash(`${i}|${rects[i].type}|${mounts.filter((m) => m.si === i).map((m) => m.part ? m.part.id + m.part.tier : '-').join(',')}|${salt}`));
   const maxHw = Math.max(...st.map((s) => s.hw));
   // What blocks fire in the rules is what stands tallest in the model: towers, funnels, sponsons.
-  const obs = dv.obstacles.map((o) => ({ o, b: obox(o, ik) }));
+  const obs = drawnObstacles(dv).map((o) => ({ o, b: obox(o, ik) }));
   const obOf = (si: number) => obs.filter((q) => q.o.si === si).map((q) => q.b);
   const towerZ = obs.find((q) => q.o.by === 'bridge')?.b, tz = towerZ ? (towerZ.z0 + towerZ.z1) / 2 : 0;
   // Utility bays of an engine block sit aft of its funnel.
