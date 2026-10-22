@@ -9,28 +9,32 @@ import { icon } from './icons';
 import { gauge, legend, segBar } from './kit';
 import { guardedSwitch } from './screens/pause';
 import {
-  SECTIONS, ARC_INFO, FACING_NAMES, FACING_SHORT, LAYERS_TAG, MAX_SECTIONS, TIER, facingAngle, facingMatters, mountArc, mountFacing, traverseIn,
-  partDef, partDesc, partName, partSlot, placementNote, weaponControl, derive, isWeapon, type Derived, type Part, type SectionType, type Build,
+  SECTIONS, ARC_INFO, FACING_NAMES, FACING_SHORT, LAYERS_TAG, MAX_SECTIONS, RING_MAX, RING_NAMES, TIER, facingAngle, facingMatters, mountArc, mountFacing,
+  mountRing, traverseIn, canPlace, partDef, partDesc, partName, partSlot, placementNote, weaponControl, derive, isWeapon,
+  type Derived, type Part, type SectionType, type Build, type TargetLayers,
 } from '../data/parts';
 import { changeBuild, dv, mods, type RunState } from '../game/run';
-import { drawBlueprint, mountDrawPos, planExtent } from '../render/shipPreview';
+import { drawBlueprint, planExtent } from '../render/shipPreview';
 import { uiSound } from './sound';
 import { draggable, dragging, cancelDrag } from './drag';
 import {
   layoutBoard, checkMove, applyMove, previewMove, partAt, sameLoc, shipStats, statDeltas, firepower,
-  canMoveSection, moveSection, previewSectionMove, canCutSection, cutSection, previewCut, rotateMount, previewRotate, rotateWhy,
-  arcView, sweep, coverage, quarters, weakestQuarter, FACING_ARROW, BLOCK_NAME, QUARTERS,
-  type Src, type Dst, type Board, type Check, type ArcView, type Coverage, type Gap,
+  canCutSection, cutSection, previewCut, rotateMount, previewRotate, rotateWhy, ringUpgradeCost, upgradeRing, previewRing,
+  arcView, sweep, coverage, quarters, weakestQuarter, FACING_ARROW, BLOCK_NAME, QUARTERS, anchorsFor, planOffset, spotAt, spotBox,
+  placeSpots, dropSpot, previewPlacing, placeModule, nudgeSpot, mountCard, shipCard, gapRank,
+  type Src, type Dst, type Board, type Check, type ArcView, type Coverage, type Gap, type Placing, type Drop, type MountCard,
 } from './refitLogic';
 
 /** A part on the quartermaster's counter (refit opened from the merchant): bought on drop. `buy` puts it in the hold. */
 export interface MarketPart { part: Part; price: number; afford: boolean; sold: boolean; buy: () => boolean }
-/** A hull section on a work slip: bought and welded to the stern on drop (or click). */
+/** A hull module on a work slip: dragged onto a spot on the plan, bought and welded there on drop (a click welds it astern). */
 export interface MarketSection { type: SectionType; cost: number; afford: boolean; sold: boolean; buy: () => boolean }
-/** Getters, read on every render: a purchase on the board changes what is sold and what the scrap affords. */
-export interface RefitExtras { market?: () => MarketPart[]; sections?: () => MarketSection[] }
+/**
+ * Getters, read on every render: a purchase on the board changes what is sold and what the scrap affords. `rings`: turret
+ * ring refits may be bought here (default: when a counter came along, i.e. at a merchant's yard).
+ */
+export interface RefitExtras { market?: () => MarketPart[]; sections?: () => MarketSection[]; rings?: boolean }
 
-const SIDE_NAME = ['port', 'centre', 'starboard'];
 /** Where a mount sits, in words: "Bow", "Port battery", "Top deck · stbd", "Engine bay". */
 function mountName(type: SectionType, i: number) {
   const n = SECTIONS[type].slots.length;
@@ -47,12 +51,9 @@ const parseDrop = (s: string | undefined): Dst | null => {
   const m = /^slot:(\d+):(\d+)$/.exec(s);
   return m ? { k: 'slot', si: +m[1], i: +m[2] } : null;
 };
-/** Board anchors: where each mount is drawn on the plan (a bridge at the bow has its gun called out above the ship). */
-const anchorsOf = (d: Derived) => d.mounts.map((m) => {
-  const [ox, oy] = mountDrawPos(d, m);
-  return { id: `${m.si}-${m.i}`, ox, oy, si: m.si, i: m.i, bow: m.si === 0 && d.rects[0].type === 'bridge' };
-});
-const layoutFor = (w: number, h: number, d: Derived) => layoutBoard({ w, h, len: d.len, width: d.width, anchors: anchorsOf(d), ...planExtent(d) });
+const layoutFor = (w: number, h: number, d: Derived) => layoutBoard({ w, h, len: d.len, width: d.width, anchors: anchorsFor(d), ...planExtent(d) });
+const ROMAN = ['', 'I', 'II', 'III'];
+const LAYER_WORD: Record<TargetLayers, string> = { air: 'Air', ground: 'Ground', both: 'Air + gnd', shots: 'Enemy fire', none: '—' };
 const deg = (a: number) => Math.round((a * 180) / Math.PI);
 /** "FS ↗": a mount's facing as the tile reads it. */
 const faceText = (f: number) => `${FACING_SHORT[f]}${FACING_ARROW[f]}`;
@@ -106,10 +107,17 @@ function rose(cov: Coverage, prev: Coverage | null, gap: Gap) {
 export function refitPanel(run: RunState, onChange: () => void, extras: RefitExtras = {}) {
   /** Picked part (click, keyboard or drag) and the target it is over. */
   let pick: Src | null = null, over: Dst | null = null, dragKind: 'part' | 'sec' | null = null;
-  let secDrag: number | null = null, secOver: number | null = null, secHl: number | null = null, cutArm: number | null = null;
+  let secOver: number | null = null, secHl: number | null = null, cutArm: number | null = null;
   let hl: { si: number; i: number } | null = null, toast = '', fresh: string | null = null, focusKey: string | null = null;
   /** A rotate button under the pointer: the board previews the turn. `hlBoard`: hl came from the plan, not a tile. */
   let rotHover: { si: number; i: number; dir: 1 | -1 } | null = null, hlBoard = false;
+  /** A ring refit button under the pointer (previewed). */
+  let ringHover: { si: number; i: number } | null = null;
+  /**
+   * A module being placed on the plan: which one, where it would land (snapped to a legal spot near the pointer, or
+   * refused with the reason), the legal spots, and the plan frame it started in (the plan holds still while it moves).
+   */
+  let place: { p: Placing; drop: Drop | null; spots: [number, number][]; off: [number, number]; onPlan: boolean; buy?: MarketSection } | null = null;
   /** Part tile under the pointer (hold or counter), for the readout. */
   let hoverPart: Part | null = null;
   let L: Board | null = null;
@@ -125,20 +133,22 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
   const strip = el('div', 'board-strip', el('span', null, 'Plan view · bow up ▲'), el('span', 'bs-mid', 'Callouts not to scale · R / wheel rotates a mount'), el('span', 'bs-len'));
   const statsEl = el('div', 'rf-stats');
   const readEl = el('div', { class: 'rf-read crt', 'aria-live': 'polite' });
+  const cmpEl = el('div', { class: 'rf-cmp', 'aria-live': 'polite', hidden: true });
   const toastEl = el('div', { class: 'toast rf-toast', role: 'status' });
   const left = el('aside', 'rf-col rf-left');
-  const right = el('aside', 'rf-col rf-right', legend('Ship’s particulars', 'live'), statsEl, readEl, toastEl);
+  const right = el('aside', 'rf-col rf-right', legend('Ship’s particulars', 'live'), cmpEl, statsEl, readEl, toastEl);
   root.append(left, el('div', 'rf-board-wrap', strip, boardEl), right);
 
   const picked = () => (pick ? partAt(run.build, run.inv, pick) : null);
   const check = (d: Dst): Check | null => (pick ? checkMove(run.build, run.inv, pick, d) : null);
   const preview = (): Build | null => {
-    if (dragKind === 'sec' && secDrag != null) {
-      if (cutArm != null || secOver === -1) return previewCut(run.build, secDrag);
-      return secOver != null ? previewSectionMove(run.build, secDrag, secOver) : null;
+    if (dragKind === 'sec' && place) {
+      if (secOver === -1 && place.p.si >= 0) return previewCut(run.build, place.p.si);
+      return place.drop?.ok && place.onPlan ? previewPlacing(run.build, place.p, place.drop.at) : null;
     }
     if (cutArm != null) return previewCut(run.build, cutArm);
     if (rotHover && !pick) return previewRotate(run.build, rotHover.si, rotHover.i, rotHover.dir);
+    if (ringHover && !pick) return previewRing(run.build, ringHover.si, ringHover.i);
     return pick && over ? previewMove(run.build, run.inv, pick, over) : null;
   };
 
@@ -161,12 +171,13 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
         el('b', 'mt-nm', p ? partDef(p.id).name : kind === 'W' ? 'Weapon mount' : 'Utility bay'),
         el('span', 'mt-sub', el('span', 'mt-pos', mountName(type, i)), p ? rankPips(p.tier) : null),
         el('span', 'mt-say')),
-      el('span', 'mt-tags', kind === 'W' ? null : el('em', 'arc-tag', ARC_INFO[arc].short), reach ? el('em', `reach-tag ${reach.layers}`, LAYERS_TAG[reach.layers]) : null),
+      el('span', 'mt-tags', kind === 'W' ? null : el('em', 'arc-tag', ARC_INFO[arc].short), reach ? el('em', `reach-tag ${reach.layers}`, LAYERS_TAG[reach.layers]) : null,
+        p && isWeapon(p.id) ? el('em', { class: 'rng-tag', title: 'Reach (field units)' }, `⌖${d.mounts.find((m) => m.si === si && m.i === i)?.range ?? 0}`) : null),
     );
     t.addEventListener('click', () => clickSlot(si, i));
     t.addEventListener('keydown', (e) => { if ((e.key === 'Delete' || e.key === 'Backspace') && p) { e.preventDefault(); move({ k: 'slot', si, i }, { k: 'hold' }); } });
     const enter = () => { hl = { si, i }; hlBoard = false; if (pick) over = dst; paintLive(); };
-    const leave = () => { if (hl && hl.si === si && hl.i === i) hl = null; if (over && sameLoc(over, dst)) over = null; rotHover = null; paintLive(); };
+    const leave = () => { if (hl && hl.si === si && hl.i === i) hl = null; if (over && sameLoc(over, dst)) over = null; rotHover = null; ringHover = null; paintLive(); };
     wrap.addEventListener('pointerenter', () => { if (!dragging()) enter(); });
     wrap.addEventListener('pointerleave', () => { if (!dragging()) leave(); });
     t.addEventListener('focus', enter); t.addEventListener('blur', leave);
@@ -188,8 +199,21 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
       return b;
     };
     wrap.classList.add('has-rot');
-    wrap.append(el('span', { class: `mt-rot${why ? ' off' : ''}`, title: why ?? `Facing ${FACING_NAMES[f]}` },
-      rb(1), el('b', 'mt-face', why ? (arc === 'ventral' ? '▼' : '◎') : faceText(f)), rb(-1)));
+    const lv = mountRing(s, i);
+    wrap.append(el('span', { class: `mt-rot${why ? ' off' : ''}`, title: why ?? `Facing ${FACING_NAMES[f]} · ${RING_NAMES[lv]}` },
+      rb(1), el('b', 'mt-face', why ? (arc === 'ventral' ? '▼' : '◎') : faceText(f), el('span', { class: 'ring-pips', 'aria-label': RING_NAMES[lv] }, ...[1, 2, 3].map((k) => el('i', k <= lv ? 'on' : null)))), rb(-1)));
+    // Turret ring refit: shown on the hovered or focused socket; hovering it previews the wider arc and the compare card.
+    const cost = ringUpgradeCost(run.build, si, i), shopWhy = ringWhy(cost);
+    const chip = el('button', {
+      class: `ring-chip${cost == null ? ' max' : ''}${shopWhy ? ' off' : ''}`, 'data-key': `ring:${si}:${i}`, 'aria-disabled': shopWhy ? 'true' : null,
+      title: shopWhy ?? `Fit a ${RING_NAMES[lv + 1].toLowerCase()}: wider arc (U)`, 'aria-label': cost == null ? `${RING_NAMES[lv]} fitted` : `Fit turret ring ${ROMAN[lv + 1]} for ${cost} scrap`,
+    }, cost == null ? `RING ${ROMAN[lv]} · MAX` : `RING ${ROMAN[lv + 1]} · ${cost}¤`);
+    chip.addEventListener('click', (e) => { e.stopPropagation(); buyRing(si, i, `ring:${si}:${i}`); });
+    const ron = () => { hl = { si, i }; hlBoard = false; ringHover = cost == null || pick ? null : { si, i }; paintLive(); };
+    chip.addEventListener('pointerenter', () => { if (!dragging()) ron(); });
+    chip.addEventListener('pointerleave', () => { if (!dragging() && ringHover) { ringHover = null; paintLive(); } });
+    chip.addEventListener('focus', ron); chip.addEventListener('blur', () => { ringHover = null; paintLive(); });
+    wrap.append(chip);
     return wrap;
   };
 
@@ -222,21 +246,31 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
   };
 
   /* ---------------- arcs on the plan ---------------- */
-  /** Fan radii on the board: the hovered mount's arc reaches well out, the rest stay close to their guns. */
-  const radii = (s: number) => { const hot = Math.max(84, Math.min(140, s * 58)); return { hot, faint: hot * 0.42 }; };
+  /**
+   * Range scale (board px per field unit): true reach would cover the whole sheet, so every fan is drawn to one common
+   * scale (the strip shows it), the hovered mount's at full reach, the others at a fraction so they stay by their guns.
+   */
+  const rangeK = () => (L ? Math.min(L.w, L.h) * 0.36 / 1000 : 0.2);
+  const fanR = (range: number, hot: boolean) => Math.max(hot ? 26 : 12, range * rangeK() * (hot ? 1 : 0.42));
   /**
    * One mount's arc on the plan: the open sectors as a translucent fan, the bearings the hull blocks hatched red and,
    * when hot, labelled by what blocks them, a facing pointer and the arc's name. `was`: the arc before a previewed turn.
    */
   const arcSvg = (x: number, y: number, av: ArcView, r: number, hot: boolean, was: ArcView | null = null) => {
     const col = ARC_INFO[av.arc].col, g = svg('g', { class: `arc-w${hot ? ' hot' : ''}${av.down ? ' down' : ''}`, style: `--arc:${col}` });
-    if (av.down) { for (const rr of [0.35, 0.6, 0.85]) g.append(svg('circle', { cx: x, cy: y, r: r * rr })); }
+    if (av.down) { for (const rr of hot ? [0.33, 0.66, 1] : [0.5, 1]) g.append(svg('circle', { cx: x, cy: y, r: r * rr })); }
     else {
       if (was) for (const s of was.open) g.append(svg('path', { class: 'was', d: wedge(x, y, r, s.c, s.h) }));
       for (const s of av.open) g.append(svg('path', { d: wedge(x, y, r, s.c, s.h) }));
       for (const b of av.blocked) g.append(svg('path', { class: 'blk', d: wedge(x, y, r, b.c, b.h) }));
     }
     if (!hot) return g;
+    // Reach: a dashed range ring and the number where the ring crosses the facing (ventral: its ground reach, up top).
+    // At the clockwise edge of the widest open sector, clear of the facing pointer and the arc's name.
+    const wo = av.open.reduce((b, q) => (q.h > b.h ? q : b), { c: 0.7, h: 0 }), ra = facingMatters(av.arc) && wo.h > 0 && wo.h < Math.PI - 0.01 ? wo.c + wo.h - 0.1 : 0.7;
+    g.append(svg('circle', { class: 'rng', cx: x, cy: y, r }));
+    const rt = svg('text', { class: 'rng-lbl', x: x + Math.sin(ra) * (r + 14), y: y - Math.cos(ra) * (r + 14) + 3, 'text-anchor': 'middle' });
+    rt.textContent = `${av.range}`; g.append(rt);
     if (!av.down) for (const b of av.blocked) {
       if (b.h < 0.05) continue;
       const rr = b.h < 0.16 ? r + 12 : r * 0.68, tx = svg('text', { x: x + Math.sin(b.c) * rr, y: y - Math.cos(b.c) * rr + 3, 'text-anchor': 'middle', class: 'blk-lbl' });
@@ -294,14 +328,13 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
     const show = nd ?? d;
     const kids: SVGElement[] = [hatchDefs()];
     const tgt = over?.k === 'slot' ? `${over.si}-${over.i}` : hl ? `${hl.si}-${hl.i}` : null;
-    const { hot: rHot, faint: rFaint } = radii(L.ship.s);
     const faint: SVGElement[] = [], strong: SVGElement[] = [];
     const arcFor = (si: number, i: number, cand: boolean, hot: boolean) => {
       const av = arcView(show, si, i, cand && p ? p.id : undefined); if (!av || (!av.open.length && !av.blocked.length)) return;
       const was = hot && rotHover && rotHover.si === si && rotHover.i === i ? arcView(d, si, i) : null;
       const an = L!.anchors[`${si}-${i}`]; if (!an) return; // a cut or reordered preview: drawn below at its own layout
       const [x, y] = an;
-      (hot ? strong : faint).push(arcSvg(x, y, av, hot ? rHot : rFaint, hot, was));
+      (hot ? strong : faint).push(arcSvg(x, y, av, fanR(av.range, hot), hot, was));
     };
     if (p && dragKind !== 'sec') { for (const t of L.tiles) { const [si, i] = t.id.split('-').map(Number); if (check({ k: 'slot', si, i })?.ok && t.id !== tgt) arcFor(si, i, true, false); } }
     else for (const m of show.mounts) if (m.part && isWeapon(m.part.id) && facingMatters(m.arc) && `${m.si}-${m.i}` !== tgt) arcFor(m.si, m.i, false, false);
@@ -322,20 +355,45 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
     if (L.mode === 'stacked') lines.querySelectorAll('.balloon text').forEach((tx, k) => { tx.textContent = String(L!.tiles[k].n); });
     // The plan itself redraws with the previewed fit (same hull, so the callouts stay put).
     const k = canvas.width / Math.max(1, L.w), sameHull = !nb || nb.sections.length === run.build.sections.length && nb.sections.every((s, si) => s.type === run.build.sections[si].type);
-    boardEl.classList.toggle('reshaping', !sameHull);
-    if (sameHull) drawBlueprint(canvas, show, false, tgt ? { si: +tgt.split('-')[0], i: +tgt.split('-')[1] } : null, { fit: { ...L.ship, k }, section: secHl, arcs: false });
+    boardEl.classList.toggle('reshaping', !sameHull || !!place);
+    boardEl.classList.toggle('placing', !!place);
+    if (place && secOver !== -1) paintPlacing(show, nb, k);
+    else if (sameHull) drawBlueprint(canvas, show, false, tgt ? { si: +tgt.split('-')[0], i: +tgt.split('-')[1] } : null, { fit: { ...L.ship, k }, section: secHl, arcs: false });
     else {
-      // A reordered or cut hull: draw the new plan at its own fit with every gun's arc as it would be, and fade the
-      // callouts until it is committed.
-      const nL = layoutFor(L.w, L.h, nd!);
-      const moved = secDrag != null && secOver != null && secOver >= 0 ? secOver : null;
-      drawBlueprint(canvas, nd!, false, null, { fit: { ...nL.ship, k }, section: moved, arcs: false });
-      const r = radii(nL.ship.s).faint * 1.25, out: SVGElement[] = [hatchDefs()];
-      for (const m of nd!.mounts) if (m.part && isWeapon(m.part.id) && facingMatters(m.arc)) { const av = arcView(nd!, m.si, m.i)!, [x, y] = nL.anchors[`${m.si}-${m.i}`]; out.push(arcSvg(x, y, av, r, false)); }
+      // A cut hull: draw the new plan at its own fit with every gun's arc as it would be, and fade the callouts.
+      const nL = layoutFor(L.w, L.h, nd!), out: SVGElement[] = [hatchDefs()];
+      drawBlueprint(canvas, nd!, false, null, { fit: { ...nL.ship, k }, arcs: false });
+      for (const m of nd!.mounts) if (m.part && isWeapon(m.part.id) && facingMatters(m.arc)) { const av = arcView(nd!, m.si, m.i)!, [x, y] = nL.anchors[`${m.si}-${m.i}`]; out.push(arcSvg(x, y, av, fanR(av.range, false) * 1.3, false)); }
       lines.replaceChildren(...out);
     }
     paintStats(d, nd);
+    paintCompare(d, nd);
     paintRead(d);
+  };
+
+  /**
+   * Placing a module: the plan holds still in the frame the drag started in (so the pointer and the grid agree), every
+   * legal spot shows as a ghost outline, the spot under the pointer is lit (or red, with the reason), and the ship is
+   * drawn as it would be with every gun's arc from its new place.
+   */
+  const paintPlacing = (show: Derived, nb: Build | null, k: number) => {
+    const P = place!, Lb = L!, s = Lb.ship.s, offN = planOffset(nb ?? run.build, show);
+    const dx = (offN[0] - P.off[0]) * s, dy = (offN[1] - P.off[1]) * s, fit = { cx: Lb.ship.cx + dx, cy: Lb.ship.cy + dy, s, k };
+    const moving = P.p.si >= 0 ? P.p.si : nb ? nb.sections.length - 1 : null;
+    drawBlueprint(canvas, show, false, null, { fit, section: nb ? moving : P.p.si >= 0 ? P.p.si : null, arcs: false });
+    const out: SVGElement[] = [hatchDefs()];
+    const bx = (at: [number, number]) => { const b = spotBox(P.p.type, at, P.off); return { x: Lb.ship.cx + b.x * s, y: Lb.ship.cy + b.y * s, w: b.w * s, h: b.h * s }; };
+    for (const at of P.spots) { const r = bx(at); out.push(svg('rect', { class: 'spot', x: r.x, y: r.y, width: r.w, height: r.h })); }
+    for (const m of show.mounts) if (m.part && isWeapon(m.part.id) && facingMatters(m.arc)) {
+      const av = arcView(show, m.si, m.i)!; out.push(arcSvg(fit.cx + m.ox * s, fit.cy + m.oy * s, av, fanR(av.range, false) * 1.3, false));
+    }
+    if (P.drop && P.onPlan) {
+      const r = bx(P.drop.at), g = svg('g', { class: `spot-on${P.drop.ok ? '' : ' bad'}` }, svg('rect', { x: r.x, y: r.y, width: r.w, height: r.h }));
+      const tx = svg('text', { x: r.x + r.w / 2, y: r.y - 6, 'text-anchor': 'middle' });
+      tx.textContent = P.drop.ok ? `${SECTIONS[P.p.type].name.toUpperCase()} · ${P.drop.at[0]}, ${P.drop.at[1]}` : (P.drop.why ?? '').toUpperCase();
+      g.append(tx); out.push(g);
+    }
+    lines.replaceChildren(...out);
   };
 
   /* ---------------- particulars ---------------- */
@@ -376,15 +434,51 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
           el('div', `rose-gap ${gap.severity}`, el('b', null, gap.label),
             el('span', null, gap.severity === 'thin' ? 'Every bearing is covered.' : `${deg(gap.h * 2)}° with ${gap.severity === 'blind' ? 'nothing bearing' : gap.label.startsWith('NO AA') ? 'no anti-air' : 'no ground fire'}. ${QUARTER_HINT[gap.key]}`)))));
   };
+  /**
+   * The compare card: current vs new, side by side, for whatever is being tried (a part over a socket, a rotation, a
+   * ring refit, a module on a new spot): the mount's own numbers, then the ship's totals, each with its change.
+   */
+  const paintCompare = (d: Derived, nd: Derived | null) => {
+    const p = picked();
+    const mnt = p && over?.k === 'slot' && check(over)?.ok ? { si: over.si, i: over.i } : rotHover && !pick ? rotHover : ringHover && !pick ? ringHover : null;
+    const P = place;
+    if (!nd && !(P && P.drop && P.onPlan)) { cmpEl.hidden = true; cmpEl.replaceChildren(); return; }
+    const title = P ? `${P.buy ? 'Weld new' : 'Move'} ${SECTIONS[P.p.type].name}` : ringHover && mnt === ringHover ? `Turret ring refit · ${ringUpgradeCost(run.build, mnt.si, mnt.i)} scrap`
+      : rotHover && mnt === rotHover ? `Rotate ${mountName(run.build.sections[mnt.si].type, mnt.i)}` : mnt ? `${p ? partName(p) : ''} → ${mountName(run.build.sections[mnt.si].type, mnt.i)}` : 'Change';
+    const f1 = (v: number) => (Math.abs(v) >= 10 || Number.isInteger(v) ? String(Math.round(v)) : v.toFixed(2).replace(/\.?0+$/, ''));
+    const rows: Node[] = [el('div', 'cmp-row cmp-hd', el('span'), el('b', null, 'NOW'), el('b', null, 'NEW'), el('em'))];
+    const num = (label: string, a: number | null, b: number | null, up = true, unit = '') => {
+      const dv0 = a != null && b != null ? Math.round((b - a) * 100) / 100 : 0, cls = dv0 ? ((dv0 > 0) === up ? ' up' : ' down') : '';
+      rows.push(el('div', `cmp-row${cls}`, el('span', 'cmp-k', label), el('b', null, a == null ? '—' : f1(a) + unit), el('b', 'cmp-n', b == null ? '—' : f1(b) + unit),
+        el('em', null, dv0 ? `${dv0 > 0 ? '▲' : '▼'}${f1(Math.abs(dv0))}` : '')));
+    };
+    const txt = (label: string, a: string, b: string, better: boolean | null = null) => rows.push(el('div', `cmp-row${a === b ? '' : better == null ? ' moved' : better ? ' up' : ' down'}`,
+      el('span', 'cmp-k', label), el('b', null, a), el('b', 'cmp-n', b), el('em', null, a === b ? '' : better == null ? '•' : better ? '▲' : '▼')));
+    if (mnt && nd) {
+      const a = mountCard(d, mnt.si, mnt.i)!, b = mountCard(nd, mnt.si, mnt.i)!, arcTxt = (c: MountCard) => (c.arc == null ? ARC_INFO[c.arcKind].short : `${c.arc}°`);
+      rows.push(el('div', 'cmp-sec', 'Mount'));
+      txt('Part', a.tier ? `${a.name} ${TIER[a.tier]}` : a.name, b.tier ? `${b.name} ${TIER[b.tier]}` : b.name);
+      num('Air dmg/s', a.air, b.air); num('Gnd dmg/s', a.ground, b.ground); num('Cooldown', a.cd, b.cd, false, 's'); num('Range', a.range || null, b.range || null);
+      txt('Clear arc', arcTxt(a), arcTxt(b), a.arc != null && b.arc != null ? b.arc > a.arc : null);
+      txt('Engages', LAYER_WORD[a.layers], LAYER_WORD[b.layers]); txt('Turret ring', ROMAN[a.ring], ROMAN[b.ring], b.ring > a.ring);
+    }
+    const sa = shipCard(d), sb = nd ? shipCard(nd) : null;
+    rows.push(el('div', 'cmp-sec', 'Ship'));
+    num('Hull', sa.hull, sb?.hull ?? null); num('Speed', sa.speed, sb?.speed ?? null); num('Anti-air', sa.air, sb?.air ?? null); num('Anti-ground', sa.ground, sb?.ground ?? null);
+    if (sb) txt('Worst gap', sa.gap.label, sb.gap.label, gapRank(sb.gap) === gapRank(sa.gap) ? null : gapRank(sb.gap) < gapRank(sa.gap));
+    const why = P && P.drop && !P.drop.ok ? el('p', 'cmp-why', `✕ ${P.drop.why}`) : null;
+    cmpEl.hidden = false;
+    cmpEl.replaceChildren(el('div', 'cmp-title', el('span', null, 'Compare'), el('b', null, title)), ...rows, ...(why ? [why] : []));
+  };
   const paintRead = (d: Derived) => {
     const p = picked();
     const head = (q: Part) => el('div', 'rd-head', icon(q.id), el('b', null, partName(q)), rankPips(q.tier));
     let body: (Node | null)[];
-    if (dragKind === 'sec' && secDrag != null) {
-      const s = run.build.sections[secDrag];
-      body = [el('div', 'rd-head', icon(s.type), el('b', null, SECTIONS[s.type].name)),
-        el('p', null, secOver === -1 || cutArm != null ? 'Cut loose: the section is lost, its parts go to the hold.' : secOver != null ? `Moves to frame ${String(secOver + 1).padStart(2, '0')}. Every gun shifts along the keel; the plan shows its arcs from there.` : 'Drop between frames to reorder.'),
-        el('p', 'rd-dim', 'Order is where the guns sit: the bridge tower and funnels mask the turrets around them, sponsons the sponsons beside them.')];
+    if (dragKind === 'sec' && place) {
+      const P = place;
+      body = [el('div', 'rd-head', icon(P.p.type), el('b', null, SECTIONS[P.p.type].name)),
+        el('p', null, secOver === -1 ? 'Cut loose: the module is lost, its parts go to the hold.' : !P.onPlan ? 'Carry it onto the plan: the outlines are the spots where it joins the hull.' : P.drop?.ok ? `Drop to ${P.buy ? `buy (${P.buy.cost} scrap) and weld it` : 'fit it'} here. The plan shows every gun's arc from the new shape.` : `✕ ${P.drop?.why ?? ''}`),
+        el('p', 'rd-dim', 'Shape is strategy: the bridge tower and funnels mask the turrets around them, and every module masks the sponsons beside and ahead of it.')];
     } else if (p) {
       const c = over ? check(over) : null;
       const where = over?.k === 'slot' ? (() => {
@@ -407,7 +501,8 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
       body = q ? [head(q), el('p', null, partDesc(q)), aim, el('p', 'rd-dim', `${mountName(s.type, hl.i)}. Drag to another socket to swap, or to the hold.`)]
         : s ? [el('div', 'rd-head', el('b', null, mountName(s.type, hl.i))), el('p', 'rd-dim', SECTIONS[s.type].slots[hl.i] === 'W' ? ARC_INFO[mountArc(s.type, 'W', null)].desc : 'Utility bay inside the hull: armor, shields, engines, drones.'), aim] : [];
     } else body = [el('p', 'rd-dim', 'Drag a part from the hold onto a socket. Drag between sockets to swap, back to the hold to unmount.'),
-      el('p', 'rd-dim', 'Rotate a mount with ⟳ ⟲ on its tile, R / Shift+R or the wheel over it. Its fan on the plan is where it can fire; red hatching is what the bridge tower, funnels or a sponson block.'),
+      el('p', 'rd-dim', 'Rotate a mount with ⟳ ⟲ on its tile, R / Shift+R or the wheel over it. Its fan on the plan is where it can fire, drawn to its reach; red hatching is what the bridge tower, funnels or another module block.'),
+      el('p', 'rd-dim', 'Drag a module on the plan (or from the list) to reshape the ship; outlines show where it can join. Arrow keys nudge the focused module. A turret ring refit (hover a socket) widens its arc.'),
       el('p', 'rd-dim', 'Or click a part, then a socket. Esc lets go; Delete unmounts the focused socket.')];
     readEl.replaceChildren(...body.filter(Boolean) as Node[]);
     toastEl.textContent = toast;
@@ -440,7 +535,7 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
       const m = market.flatMap((mp, i) => (mp.sold ? [] : [partTile(mp.part, { k: 'market', i, part: mp.part, price: mp.price, afford: mp.afford }, { price: mp.price, afford: mp.afford })]));
       kids.push(legend('Quartermaster', 'drag to buy and mount'), el('div', 'rf-market', ...(m.length ? m : [el('span', 'dim hold-empty', 'Counter cleared.')])));
     }
-    kids.push(legend('Hull sections', 'bow to stern'), secsEl);
+    kids.push(legend('Hull modules', 'drag on plan'), secsEl);
     left.replaceChildren(...kids);
     paintSecs();
   };
@@ -448,29 +543,34 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
     const ol = el('ol', 'secs');
     run.build.sections.forEach((s, si) => {
       const sd = SECTIONS[s.type], fixed = s.type === 'bridge';
-      const li = el('li', { class: `sec${fixed ? ' fixed' : ''}${secDrag === si ? ' lifted' : ''}${secOver === si && secDrag != null && secDrag !== si ? (secDrag < si ? ' ins-after' : ' ins-before') : ''}`, 'data-drop': `sec:${si}`, 'data-sec': si });
+      const li = el('li', { class: `sec${fixed ? ' fixed' : ''}${place?.p.si === si ? ' lifted' : ''}`, 'data-sec': si, tabindex: 0, 'aria-label': `${sd.name}: drag onto the plan to move it, arrow keys nudge it` });
       const grip = el('span', { class: 'sec-grip', 'aria-hidden': 'true' }, el('i'), el('i'), el('i'));
       const pips = el('span', 'sec-pips', ...s.slots.map((p, i) => el('i', { class: `${sd.slots[i] === 'W' ? 'w' : 'u'}${p ? ' on' : ''}`, title: p ? partName(p) : 'empty' })));
-      // The bridge moves like any frame (its tower masks the turrets around it) but is never cut loose.
-      const ctl = el('span', 'sec-ctl',
-        el('button', { class: 'btn small', 'aria-label': `Move ${sd.name} toward bow`, title: 'Toward bow', disabled: !canMoveSection(run.build, si, si - 1), onclick: () => moveSec(si, si - 1) }, '▲'),
-        el('button', { class: 'btn small', 'aria-label': `Move ${sd.name} toward stern`, title: 'Toward stern', disabled: !canMoveSection(run.build, si, si + 1), onclick: () => moveSec(si, si + 1) }, '▼'),
+      // Placement is on the plan: these step the module to the next legal spot that way (like the arrow keys).
+      const nb = (dx: number, dy: number, g: string, word: string) => el('button', { class: 'btn small nudge', 'aria-label': `Move ${sd.name} ${word}`, title: `Nudge ${word}`, disabled: !nudgeSpot(run.build, si, dx, dy), onclick: () => nudge(si, dx, dy) }, g);
+      const ctl = el('span', 'sec-ctl', nb(-1, 0, '◀', 'to port'), nb(0, -1, '▲', 'forward'), nb(0, 1, '▼', 'aft'), nb(1, 0, '▶', 'to starboard'),
         fixed ? el('span', { class: 'sec-lock', title: 'The bridge commands the ship: it cannot be cut loose.' }, 'Keel') : (() => { const g = guardedSwitch('Cut', 'Confirm', () => cut(si)); g.classList.add('small'); g.setAttribute('aria-label', `Cut ${sd.name} loose`); return g; })());
       li.append(grip, el('span', 'sec-no', String(si + 1).padStart(2, '0')), icon(s.type),
         el('span', 'sec-nm', el('b', null, sd.name), el('small', null, `+${sd.hp} hull · mass ${sd.mass}${sd.thrust ? ` · thr ${sd.thrust}` : ''}`)), pips, ctl);
       li.addEventListener('pointerenter', () => { if (!dragging()) { secHl = si; paintLive(); } });
       li.addEventListener('pointerleave', () => { if (!dragging() && secHl === si) { secHl = null; paintLive(); } });
-      draggable(li, () => secDragHooks(si, li));
+      li.addEventListener('focus', () => { secHl = si; paintLive(); }); li.addEventListener('blur', () => { if (secHl === si) { secHl = null; paintLive(); } });
+      li.addEventListener('keydown', (e) => {
+        const dir = ({ ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] } as Record<string, [number, number]>)[e.key];
+        if (dir && e.target === li) { e.preventDefault(); nudge(si, dir[0], dir[1], true); }
+      });
+      draggable(li, () => moduleDrag({ si, type: s.type }, () => li.cloneNode(true) as HTMLElement));
       ol.append(li);
     });
-    const bin = el('div', { class: 'cut-bin', 'data-drop': 'cut' }, icon('hazard-sign'), el('span', null, 'Drop a section here to cut it loose'));
+    const bin = el('div', { class: 'cut-bin', 'data-drop': 'cut' }, icon('hazard-sign'), el('span', null, 'Drop a module here to cut it loose'));
     const confirm = cutArm != null && run.build.sections[cutArm] ? el('div', 'cut-confirm', el('span', null, `Cut the ${SECTIONS[run.build.sections[cutArm].type].name} loose? Its parts go to the hold.`),
       el('button', { class: 'btn small danger', id: 'btn-cut-confirm', onclick: () => { const s = cutArm!; cutArm = null; cut(s); } }, 'Confirm cut'),
       el('button', { class: 'btn small', onclick: () => { cutArm = null; render(); } }, 'Keep')) : null;
     const welds = extras.sections?.().filter((m) => !m.sold).map((m) => {
       const full = run.build.sections.length >= MAX_SECTIONS;
       const b = el('button', { class: `wslip${!m.afford || full ? ' short' : ''}`, disabled: !m.afford || full, 'data-weld': m.type, onclick: () => weld(m) },
-        icon(m.type), el('span', null, el('b', null, SECTIONS[m.type].name), el('small', null, full ? 'No berth' : `${m.cost} scrap · weld to stern`)));
+        icon(m.type), el('span', null, el('b', null, SECTIONS[m.type].name), el('small', null, full ? 'No berth' : `${m.cost} scrap · drag onto the plan`)));
+      if (m.afford && !full) draggable(b, () => moduleDrag({ si: -1, type: m.type }, () => b.cloneNode(true) as HTMLElement, m));
       return b;
     }) ?? [];
     secsEl.replaceChildren(ol, ...(welds.length ? [el('div', 'rf-welds', ...welds)] : []), confirm ?? bin);
@@ -496,32 +596,42 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
       end: () => { dragKind = null; if (pick && sameLoc(pick, src)) pick = null; over = null; render(); },
     };
   };
-  const secDragHooks = (si: number, li: HTMLElement) => ({
-    ghost: () => li.cloneNode(true) as HTMLElement,
-    start: () => { secDrag = si; secOver = null; dragKind = 'sec' as const; pick = null; secHl = si; cutArm = null; uiSound('press'); paintSecsLive(); paintLive(); },
-    over: (t: HTMLElement | null) => {
-      const v = t?.dataset.drop;
-      secOver = v === 'cut' ? -1 : v?.startsWith('sec:') ? +v.slice(4) : null;
-      if (secOver != null && secOver >= 0 && !canMoveSection(run.build, si, secOver)) secOver = null;
-      paintSecsLive(); paintLive();
-    },
-    drop: (t: HTMLElement | null) => {
-      const v = t?.dataset.drop;
-      if (v === 'cut' && canCutSection(run.build, si)) return () => { cutArm = si; uiSound('deny'); };
-      const to = v?.startsWith('sec:') ? +v.slice(4) : -1;
-      if (to >= 0 && canMoveSection(run.build, si, to)) return () => moveSec(si, to);
-      return null;
-    },
-    end: () => { dragKind = null; secDrag = null; secOver = null; secHl = null; render(); },
-  });
-  const paintSecsLive = () => {
-    secsEl.querySelectorAll<HTMLElement>('li.sec').forEach((li) => {
-      const s = +li.dataset.sec!;
-      li.classList.toggle('lifted', secDrag === s);
-      li.classList.toggle('ins-before', secOver === s && secDrag != null && secDrag > s);
-      li.classList.toggle('ins-after', secOver === s && secDrag != null && secDrag < s);
-    });
-    secsEl.querySelector('.cut-bin')?.classList.toggle('over', secOver === -1);
+  /** Client rect of a grid spot on the board (the frame the drag started in). */
+  const spotRect = (P: NonNullable<typeof place>, at: [number, number]) => {
+    const b = spotBox(P.p.type, at, P.off), r = boardEl.getBoundingClientRect(), s = L!.ship.s;
+    return new DOMRect(r.left + L!.ship.cx + b.x * s, r.top + L!.ship.cy + b.y * s, b.w * s, b.h * s);
+  };
+  /**
+   * Carry a module (from the plan, the list, or a work slip on the counter) to a spot on the plan: the drop snaps to the
+   * nearest legal spot, the plan previews the reshaped ship, and the cut bin takes an existing module.
+   */
+  const moduleDrag = (p: Placing, ghost: () => HTMLElement, buy?: MarketSection) => {
+    if (!L || L.mode === 'stacked') return null;
+    return {
+      ghost,
+      start: () => {
+        place = { p, drop: null, spots: placeSpots(run.build, p), off: planOffset(run.build, dv(run)), onPlan: false, buy };
+        dragKind = 'sec' as const; pick = null; hl = null; secHl = p.si >= 0 ? p.si : null; cutArm = null; secOver = null; uiSound('press'); paintLive();
+      },
+      over: (t: HTMLElement | null) => { secOver = t?.dataset.drop === 'cut' && p.si >= 0 ? -1 : null; secsEl.querySelector('.cut-bin')?.classList.toggle('over', secOver === -1); paintLive(); },
+      move: (x: number, y: number) => {
+        const P = place; if (!P || !L) return;
+        const r = boardEl.getBoundingClientRect(), on = x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+        const raw = spotAt(p.type, (x - r.left - L.ship.cx) / L.ship.s, (y - r.top - L.ship.cy) / L.ship.s, P.off);
+        const drop = on ? dropSpot(run.build, p, raw, P.spots) : null;
+        if (on === P.onPlan && drop?.at[0] === P.drop?.at[0] && drop?.at[1] === P.drop?.at[1] && drop?.ok === P.drop?.ok) return;
+        P.onPlan = on; P.drop = drop; paintLive();
+      },
+      snapTo: () => (place?.drop && place.onPlan ? spotRect(place, place.drop.at) : null),
+      drop: (t: HTMLElement | null) => {
+        if (t?.dataset.drop === 'cut' && p.si >= 0) return canCutSection(run.build, p.si) ? () => { cutArm = p.si; uiSound('deny'); } : null;
+        const P = place; if (!P?.onPlan || !P.drop) return null;
+        if (!P.drop.ok) { uiSound('deny'); toast = P.drop.why ?? ''; return null; }
+        const at = P.drop.at;
+        return () => placeAt(p, at, buy);
+      },
+      end: () => { dragKind = null; place = null; secOver = null; secHl = null; render(); },
+    };
   };
 
   /* ---------------- actions (all through changeBuild, as before) ---------------- */
@@ -554,11 +664,37 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
     if (run.build.sections[si].slots[i]) { pick = { k: 'slot', si, i }; over = null; toast = 'Picked up. Click another socket to swap, or Return to hold.'; focusKey = key(dst); render(); }
     else { toast = 'Pick a part from the hold first, or drag one here.'; uiSound('deny'); render(); }
   }
-  function moveSec(from: number, to: number) {
-    if (!canMoveSection(run.build, from, to)) return;
-    const name = SECTIONS[run.build.sections[from].type].name;
-    changeBuild(run, () => { moveSection(run.build, from, to); });
-    toast = `${name} moved to frame ${String(to + 1).padStart(2, '0')}.`; uiSound('stamp'); onChange(); render();
+  /** Fit module p at grid spot `at` (a new module from the counter is bought and welded first). */
+  function placeAt(p: Placing, at: [number, number], buy?: MarketSection) {
+    let si = p.si;
+    if (buy) {
+      const n = run.build.sections.length;
+      if (!buy.buy() || run.build.sections.length !== n + 1) { uiSound('deny'); toast = 'The yard cannot weld it on.'; render(); return; }
+      si = n;
+    }
+    const ok = !!run.build.sections[si] && !canPlace(run.build, si, at);
+    if (ok) changeBuild(run, () => { placeModule(run.build, si, at); });
+    toast = `${SECTIONS[p.type].name} ${buy ? 'welded on' : 'moved'}${ok ? '' : ' astern (that spot closed)'}.`; uiSound(buy ? 'buy' : 'stamp'); onChange(); render();
+  }
+  /** Step module si to the next legal spot in a direction (keyboard and the list's nudge buttons). */
+  function nudge(si: number, dx: number, dy: number, keepFocus = false) {
+    const at = nudgeSpot(run.build, si, dx, dy);
+    if (!at) { uiSound('deny'); toast = 'No spot that way keeps the hull joined.'; paintLive(); return; }
+    changeBuild(run, () => { placeModule(run.build, si, at); });
+    toast = `${SECTIONS[run.build.sections[si].type].name} moved.`; uiSound('flap'); onChange(); render();
+    if (keepFocus) (secsEl.querySelector(`li.sec[data-sec="${si}"]`) as HTMLElement | null)?.focus({ preventScroll: true });
+  }
+  /** Turret rings are bought where the yard is (a merchant's counter came along, or `extras.rings`). */
+  const ringWhy = (cost: number | null) => cost == null ? 'Full ring already fitted.' : !(extras.rings ?? !!(extras.market || extras.sections)) ? 'Turret rings are fitted at a merchant’s yard: open the refit from a merchant.'
+    : run.scrap < cost ? `Short of scrap: ${cost} needed.` : null;
+  function buyRing(si: number, i: number, focus: string | null = null) {
+    const cost = ringUpgradeCost(run.build, si, i), why = ringWhy(cost);
+    if (why) { uiSound('deny'); toast = why; paintLive(); return; }
+    run.scrap -= cost!;
+    changeBuild(run, () => { upgradeRing(run.build, si, i); });
+    const lv = mountRing(run.build.sections[si], i);
+    toast = `${RING_NAMES[lv]} fitted · ${mountName(run.build.sections[si].type, i)}. ${cost} scrap.`; uiSound('buy');
+    ringHover = null; hl = { si, i }; focusKey = focus; onChange(); render();
   }
   /** Turn mount (si, i) one allowed step (dir 1 clockwise); refused with the reason where facing does not matter. */
   function rotate(si: number, i: number, dir: 1 | -1, focus: string | null = null) {
@@ -572,7 +708,7 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
   }
   /** The weapon mount at a pointer position on the board: its tile, or its ring on the plan (within 16 px). */
   const mountAt = (e: MouseEvent): { si: number; i: number; tile: boolean } | null => {
-    const ms = (e.target as HTMLElement).closest?.('.mslot') as HTMLElement | null;
+    const ms = (e.target as HTMLElement | null)?.closest?.('.mslot') as HTMLElement | null;
     if (ms) { const [si, i] = ms.dataset.mslot!.split('-').map(Number); return { si, i, tile: true }; }
     if (!L || L.mode === 'stacked') return null;
     const r = boardEl.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
@@ -605,13 +741,15 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
   // R / Shift+R turn the focused or hovered weapon mount (anywhere on the page while the board is up).
   const onKey = (e: KeyboardEvent) => {
     if (!root.isConnected) { document.removeEventListener('keydown', onKey); return; }
-    if ((e.key !== 'r' && e.key !== 'R') || e.ctrlKey || e.metaKey || e.altKey || dragging()) return;
+    const ring = e.key === 'u' || e.key === 'U';
+    if ((e.key !== 'r' && e.key !== 'R' && !ring) || e.ctrlKey || e.metaKey || e.altKey || dragging()) return;
     if ((e.target as HTMLElement | null)?.closest?.('input, textarea, select, [contenteditable]')) return;
     const ms = (document.activeElement as HTMLElement | null)?.closest?.('.mslot') as HTMLElement | null;
     const at = ms ? ms.dataset.mslot!.split('-').map(Number) : hl ? [hl.si, hl.i] : null;
     if (!at || !isWMount(at[0], at[1])) return;
     e.preventDefault();
-    rotate(at[0], at[1], e.shiftKey ? -1 : 1, ms ? (document.activeElement as HTMLElement).dataset.key ?? null : null);
+    const fk = ms ? (document.activeElement as HTMLElement).dataset.key ?? null : null;
+    if (ring) buyRing(at[0], at[1], fk); else rotate(at[0], at[1], e.shiftKey ? -1 : 1, fk);
   };
   document.addEventListener('keydown', onKey);
   function cut(si: number) {
@@ -621,8 +759,24 @@ export function refitPanel(run: RunState, onChange: () => void, extras: RefitExt
   }
   function weld(m: MarketSection) {
     if (!m.buy()) { uiSound('deny'); return; }
-    toast = `${SECTIONS[m.type].name} welded to the stern.`; uiSound('buy'); onChange(); render();
+    toast = `${SECTIONS[m.type].name} welded on astern. Drag it on the plan to move it.`; uiSound('buy'); onChange(); render();
   }
+  // Grab a module on the plan itself (away from its guns) and carry it to a new spot.
+  let downAt: { x: number; y: number; t: EventTarget | null } | null = null;
+  boardEl.addEventListener('pointerdown', (e) => { downAt = { x: e.clientX, y: e.clientY, t: e.target }; }, { capture: true });
+  const moduleUnder = (x: number, y: number) => {
+    if (!L || L.mode === 'stacked') return -1;
+    const r = boardEl.getBoundingClientRect(), fx = (x - r.left - L.ship.cx) / L.ship.s, fy = (y - r.top - L.ship.cy) / L.ship.s;
+    return dv(run).rects.findIndex((q) => fx >= q.x && fx <= q.x + q.w && fy >= q.y && fy <= q.y + q.h);
+  };
+  draggable(boardEl, () => {
+    const a = downAt; if (!a || pick || (a.t as HTMLElement | null)?.closest?.('.board-tiles')) return null;
+    if (mountAt(new MouseEvent('pointermove', { clientX: a.x, clientY: a.y }))) return null;
+    const si = moduleUnder(a.x, a.y); if (si < 0) return null;
+    const type = run.build.sections[si].type;
+    return moduleDrag({ si, type }, () => el('div', { class: 'mod-ghost', 'data-own-size': '' }, icon(type), el('b', null, SECTIONS[type].name)));
+  });
+  boardEl.addEventListener('pointermove', (e) => { if (!dragging() && e.pointerType !== 'touch') boardEl.classList.toggle('on-module', !boardEl.classList.contains('on-mount') && !(e.target as HTMLElement).closest?.('.board-tiles') && moduleUnder(e.clientX, e.clientY) >= 0); });
 
   const render = () => { if (dragging()) return; hoverPart = null; paintSide(); paintBoard(); };
   // Keyboard: Escape lets go of a picked part (a drag in progress handles its own Escape).
