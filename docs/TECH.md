@@ -408,7 +408,10 @@ tests/unit/balance.test.ts --disable-console-intercept` prints the table (`ONLY=
   55% hull smoke from their first heat core (fire below 25%); wrecks stay hot for 22 s. Headlight beams, dust plumes, contrails, rotor
   discs and drop shadows are sized in metres. Effects use `fxs(v)` (half-size in metres with a floor).
 - **Tactical symbology** (`symbology.ts`, drawn by `drawHud` under the panels in one canvas pass, preallocated arrays): per contact a tracker
-  box (corner ticks round the unit's real footprint, never covering the unit) and a NATO-style symbol above it (ground diamond, air tent,
+  box (corner ticks round the unit's real footprint, never covering the unit) and a NATO-style symbol above it. Layer styles live in
+  `marks.ts` (pure, `tests/unit/marks.test.ts`): air = hostile red open tent with a bob and a dashed drop line to a pip on its shadow
+  (`SHADOW_DX/DY/ALT` in `scale.ts`, shared with the unit layer's drop shadow); ground = burnt amber filled diamond plus a ring decal;
+  salvage = dim scrap gold square. Symbol size by threat tier from `EN` (light / standard / heavy / elite). Frames (ground diamond, air tent,
   salvage square; glyphs for armour, infantry, AA, SAM, flak tower, rotary, fixed wing, UAV, bomber, carrier, crate, pod, wreck). Contacts
   larger than `BIG` get a designator (SAM, FLAK, BOMBER...), elites a double box. Out of weapon range = 60% alpha, under our hull = 30%.
   `tele` wind-up turns the contact pale and closes a ring on it. `aim.hover` / `aim.lock` = white lock box. Damaged = a health tick.
