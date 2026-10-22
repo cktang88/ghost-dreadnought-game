@@ -27,27 +27,29 @@ export interface FightResult {
 const P = (id: string, t: number) => mkPart(id, t);
 export const BUILDS: Record<string, () => Build> = {
   starter: starterBuild,
-  /** End of sector 1: a few nodes of upgrades on the starter. */
+  /** End of sector 1: a few nodes of upgrades on the starter (the flak turret turned to cover astern). Later builds face
+ *  their mounts the way a pilot who has met rear threats would (the fore battery angled forward, a gun aft) and have
+ *  bought wide turret rings on their sponsons. */
   s1end: () => ({ sections: [
     { type: 'bridge', slots: [P('pulse', 2)] },
     { type: 'battery', slots: [P('pulse', 1), P('bomb', 1), P('pulse', 1)] },
-    { type: 'gundeck', slots: [P('spread', 1), P('flak', 1)] },
+    { type: 'gundeck', slots: [P('spread', 1), P('flak', 1)], face: [0, 4] },
     { type: 'armor', slots: [P('plate', 1)] },
     { type: 'engine', slots: [null] },
   ] }),
   mid: () => ({ sections: [
     { type: 'bridge', slots: [P('pulse', 2)] },
-    { type: 'battery', slots: [P('pulse', 2), P('bomb', 2), P('flak', 2)] },
-    { type: 'gundeck', slots: [P('spread', 2), P('missile', 2)] },
+    { type: 'battery', slots: [P('pulse', 2), P('bomb', 2), P('flak', 2)], face: [7, 2, 3], ring: [2, 1, 2] },
+    { type: 'gundeck', slots: [P('spread', 2), P('missile', 2)], face: [0, 4] },
     { type: 'armor', slots: [P('plate', 2)] },
     { type: 'spine', slots: [P('shield', 1), P('repair', 1)] },
     { type: 'engine', slots: [P('thruster', 1)] },
   ] }),
   late: () => ({ sections: [
     { type: 'bridge', slots: [P('rail', 3)] },
-    { type: 'battery', slots: [P('pulse', 3), P('artillery', 3), P('pulse', 3)] },
-    { type: 'battery', slots: [P('flak', 3), P('bomb', 3), P('spread', 3)] },
-    { type: 'gundeck', slots: [P('missile', 3), P('tesla', 3)] },
+    { type: 'battery', slots: [P('pulse', 3), P('artillery', 3), P('pulse', 3)], face: [7, 2, 1], ring: [2, 1, 2] },
+    { type: 'battery', slots: [P('flak', 3), P('bomb', 3), P('spread', 3)], face: [5, 2, 2], ring: [2, 1, 2] },
+    { type: 'gundeck', slots: [P('missile', 3), P('tesla', 3)], ring: [2, 1] },
     { type: 'armor', slots: [P('plate', 3)] },
     { type: 'spine', slots: [P('shield', 2), P('reactor', 2)] },
     { type: 'engine', slots: [P('thruster', 2)] },
@@ -80,11 +82,17 @@ function steer(bot: Bot) {
   // threats: telegraphed strikes and charging beams that would land on the hull
   for (const b of S.eb) {
     if (b.kind === 'strike' && Math.abs(b.x - p.x) < p.dv.width / 2 + b.rad && Math.abs(b.y - p.y) < p.dv.len / 2 + b.rad) gx = p.x + (p.x > b.x ? 1 : -1) * (p.dv.width + b.rad);
-    if (b.kind === 'beam' && !b.fired && b.x2 === undefined && Math.abs(b.x - p.x) < p.dv.width / 2 + b.w) gx = p.x + (p.x > b.x ? 1 : -1) * (p.dv.width + b.w * 2);
-    // ghost broadside rails run across the field: step off the line, up or down
-    if (b.kind === 'beam' && !b.fired && b.x2 !== undefined && (p.x - b.x) * (b.x2 - b.x) > 0) {
-      const k = (p.x - b.x) / (b.x2 - b.x), ly = b.y + (b.y2 - b.y) * k;
-      if (Math.abs(ly - p.y) < p.dv.len / 2 + b.w) gy = p.y + (p.y > ly ? 1 : -1) * (p.dv.len / 2 + b.w * 2);
+    // charging rails (straight down, or aimed along a ghost gun's bearing): step off the line, square to it
+    if (b.kind === 'beam' && !b.fired) {
+      const x2 = b.x2 ?? b.x, y2 = b.y2 ?? H + 400, L = Math.hypot(x2 - b.x, y2 - b.y) || 1, ux = (x2 - b.x) / L, uy = (y2 - b.y) / L;
+      const k = (p.x - b.x) * ux + (p.y - b.y) * uy;
+      if (k > 0) {
+        let nx = p.x - (b.x + ux * k), ny = p.y - (b.y + uy * k), d = Math.hypot(nx, ny);
+        if (d < 1) { nx = -uy; ny = ux; d = 1; }
+        nx /= d; ny /= d;
+        const ext = Math.abs(nx) * p.dv.width / 2 + Math.abs(ny) * p.dv.len / 2;
+        if (d < ext + b.w) { gx = p.x + nx * (ext + b.w * 2); gy = p.y + ny * (ext + b.w * 2); }
+      }
     }
   }
   p.tx = gx; p.ty = gy;
