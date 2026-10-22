@@ -103,7 +103,7 @@ export const SECTIONS: Record<SectionType, SectionDef> = {
   gundeck: { name: 'Gun Deck', w: 22, h: 26, hp: 30, mass: 2, thrust: 0, slots: ['W', 'W'], cost: 70 },
   battery: { name: 'Broadside Battery', w: 30, h: 24, hp: 35, mass: 3, thrust: 0, slots: ['W', 'W', 'W'], cost: 140 },
   armor: { name: 'Armored Hull', w: 24, h: 18, hp: 90, mass: 3, thrust: 0, slots: ['U'], cost: 60 },
-  spine: { name: 'Utility Spine', w: 19, h: 18, hp: 30, mass: 1.5, thrust: 0, slots: ['U', 'U'], cost: 80 },
+  spine: { name: 'Utility Spine', w: 20, h: 18, hp: 30, mass: 1.5, thrust: 0, slots: ['U', 'U'], cost: 80 },
   engine: { name: 'Engine Block', w: 22, h: 20, hp: 25, mass: 1, thrust: 8, slots: ['U'], cost: 55 },
 };
 /** Beam of the hull proper (design units), without sponsons. */
