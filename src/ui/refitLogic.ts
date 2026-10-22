@@ -2,8 +2,9 @@
 // leader line runs to the mount, what a drag would do (valid or not, and why), and the stat deltas it previews.
 // No DOM here, so tests/unit/refitBoard.test.ts can hold the layout to "no overlaps, no crossed leaders".
 import {
-  SECTIONS, RING_MAX, canPlace, derive, layoutIssue, layoutOf, isWeapon, layersHit, mountFacing, mountRing, nextFacing, pinLayout, ringCost, partDef, partSlot, wCd, wDmg,
-  type Build, type Derived, type Mods, type Part, type SlotKind,
+  SECTIONS, RING_MAX, canPlace, derive, facingMatters, isWeapon, layersHit, layoutIssue, layoutOf, mountArc, mountFacing, mountRing, mountTraverse,
+  nextFacing, partDef, partSlot, pinLayout, ringCost, traverseIn, wCd, wDmg,
+  type Arc, type Blocked, type Build, type Derived, type Facing, type Mods, type Mount, type Part, type Sector, type SectionType, type SlotKind, type TargetLayers,
 } from '../data/parts';
 
 /* ---------------- moves ---------------- */
@@ -140,19 +141,123 @@ export function previewCut(b: Build, si: number) { const nb = cloneBuild(b); ret
  * (a top-deck gun cannot reach the ground). A nominal figure for comparing fits, not a combat simulation:
  * scatter fans and paired pods count every bolt, flak counts two aircraft per burst, reactor and relic bonuses apply.
  */
+export function mountDps(d: Derived, m: Mount) {
+  const p = m.part, out = { air: 0, ground: 0, pd: 0 };
+  if (!p || !isWeapon(p.id)) return out;
+  if (p.id === 'pd') { out.pd = (1 / wCd(p)) * d.fireMult; return out; }
+  // Every bolt of a scatter fan and both seeker pods count; a flak burst is rated as catching two aircraft.
+  const shots = p.id === 'spread' ? (p.tier >= 3 ? 5 : 3) : p.id === 'missile' || p.id === 'flak' ? 2 : 1;
+  const dps = (wDmg(p) / wCd(p)) * shots * d.fireMult;
+  if (m.trav.sectors.length && layersHit(m.trav.layers, 'air')) out.air = dps * d.mods.dmgAir;
+  if (m.trav.sectors.length && layersHit(m.trav.layers, 'ground')) out.ground = dps * d.mods.dmgGround;
+  return out;
+}
 export function firepower(d: Derived) {
   let air = 0, ground = 0, pd = 0;
-  for (const m of d.mounts) {
-    const p = m.part;
-    if (!p || !isWeapon(p.id)) continue;
-    // Every bolt of a scatter fan and both seeker pods count; a flak burst is rated as catching two aircraft.
-    const shots = p.id === 'spread' ? (p.tier >= 3 ? 5 : 3) : p.id === 'missile' || p.id === 'flak' ? 2 : 1;
-    if (p.id === 'pd') { pd += (1 / wCd(p)) * d.fireMult; continue; }
-    const dps = (wDmg(p) / wCd(p)) * shots * d.fireMult;
-    if (layersHit(m.trav.layers, 'air')) air += dps * d.mods.dmgAir;
-    if (layersHit(m.trav.layers, 'ground')) ground += dps * d.mods.dmgGround;
-  }
+  for (const m of d.mounts) { const f = mountDps(d, m); air += f.air; ground += f.ground; pd += f.pd; }
   return { air, ground, pd };
+}
+
+/* ---------------- facing, masked arcs and the coverage rose ---------------- */
+
+/** Arrow glyph per facing (bow up the page). */
+export const FACING_ARROW = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'] as const;
+/** What blocks a gun, in drawing-callout words. */
+export const BLOCK_NAME: Record<SectionType, string> = { bridge: 'BRIDGE TOWER', engine: 'FUNNEL', battery: 'SPONSON', gundeck: 'GUN DECK', armor: 'ARMOR', spine: 'SPINE' };
+const wrap = (a: number) => { a = (a + Math.PI) % (Math.PI * 2); if (a < 0) a += Math.PI * 2; return a - Math.PI; };
+/** Is ship bearing `a` inside any sector? */
+export const bears = (ss: Sector[], a: number) => ss.some((s) => Math.abs(wrap(a - s.c)) <= s.h + 1e-9);
+/** Why mount (si, i) cannot be rotated with what is in it, or null when it can. */
+export function rotateWhy(b: Build, si: number, i: number): string | null {
+  const s = b.sections[si]; if (!s) return 'No such mount.';
+  const k = SECTIONS[s.type].slots[i];
+  if (k !== 'W') return 'Utility bays sit inside the hull: no facing.';
+  const arc = mountArc(s.type, k, s.slots[i]?.id);
+  if (arc === 'ventral') return 'Bombs and mortars drop from the belly: facing does not matter.';
+  if (arc === 'omni') return 'All-round weapon: facing does not matter.';
+  if (!facingMatters(arc) || nextFacing(s, i, 1) === null) return 'Fixed mount.';
+  return null;
+}
+/** Intersection of two sector lists (bearings both cover), trying every turn of the circle. */
+export function intersectSectors(a: Sector[], b: Sector[]): Sector[] {
+  const out: Sector[] = [];
+  for (const x of a) for (const y of b) for (const k of [-2 * Math.PI, 0, 2 * Math.PI]) {
+    const lo = Math.max(x.c - x.h, y.c - y.h + k), hi = Math.min(x.c + x.h, y.c + y.h + k);
+    if (hi - lo > 0.01) out.push({ c: wrap((lo + hi) / 2), h: (hi - lo) / 2 });
+  }
+  return out;
+}
+/** A mount's arc as the board draws it: the open (masked) sectors, and the blocked wedges clipped to its facing's arc. */
+export interface ArcView { arc: Arc; facing: Facing; open: Sector[]; blocked: Blocked[]; layers: TargetLayers; down: boolean }
+/** The arc of mount (si, i) with `partId` in it (default: the part it holds; null: empty), as derived hull `d` masks it. */
+export function arcView(d: Derived, si: number, i: number, partId?: string | null): ArcView | null {
+  const m = d.mounts.find((x) => x.si === si && x.i === i); if (!m) return null;
+  const pid = partId === undefined ? m.part?.id ?? null : partId, type = d.rects[si].type;
+  const t = traverseIn(d, si, i, pid), raw = mountTraverse(type, m.kind, pid, m.facing);
+  const blocked = t.blocked.flatMap((b) => intersectSectors(raw.sectors, [b]).map((s) => ({ ...s, by: b.by })));
+  return { arc: t.arc, facing: m.facing, open: t.sectors, blocked, layers: t.layers, down: t.down };
+}
+/** Total angle (radians) covered by sectors. */
+export const sweep = (ss: Sector[]) => ss.reduce((n, s) => n + Math.min(Math.PI, s.h) * 2, 0);
+
+/** Bearings sampled by the coverage rose (bin k is centred on k · 2π / n, clockwise from the bow). */
+export const ROSE_BINS = 36;
+export interface Coverage { n: number; air: number[]; ground: number[] }
+/** Rated dmg/s bearing on each bearing: every mount whose masked traverse includes it (ventral ordnance all round). */
+export function coverage(d: Derived, n = ROSE_BINS): Coverage {
+  const air = new Array<number>(n).fill(0), ground = new Array<number>(n).fill(0);
+  for (const m of d.mounts) {
+    const f = mountDps(d, m); if (!f.air && !f.ground) continue;
+    for (let k = 0; k < n; k++) if (bears(m.trav.sectors, wrap((k * 2 * Math.PI) / n))) { air[k] += f.air; ground[k] += f.ground; }
+  }
+  return { n, air, ground };
+}
+export type QuarterKey = 'fore' | 'stbd' | 'aft' | 'port';
+export const QUARTERS: { key: QuarterKey; c: number; name: string; short: string }[] = [
+  { key: 'fore', c: 0, name: 'AHEAD', short: 'FWD' }, { key: 'stbd', c: Math.PI / 2, name: 'TO STARBOARD', short: 'STBD' },
+  { key: 'aft', c: Math.PI, name: 'ASTERN', short: 'AFT' }, { key: 'port', c: -Math.PI / 2, name: 'TO PORT', short: 'PORT' },
+];
+/** Mean air and ground dmg/s over each quarter of the compass. */
+export function quarters(cov: Coverage) {
+  return QUARTERS.map((q) => {
+    let air = 0, ground = 0, n = 0;
+    for (let k = 0; k < cov.n; k++) if (Math.abs(wrap((k * 2 * Math.PI) / cov.n - q.c)) < Math.PI / 4 + 1e-9) { air += cov.air[k]; ground += cov.ground[k]; n++; }
+    return { ...q, air: air / Math.max(1, n), ground: ground / Math.max(1, n) };
+  });
+}
+export interface Gap {
+  key: QuarterKey; name: string; label: string; severity: 'blind' | 'gap' | 'thin'; air: number; ground: number;
+  /** The gap itself as a ship-space sector (the whole quarter when nothing is missing). */ c: number; h: number;
+}
+/** Longest run of bins (wrapping) where `vs` is zero: start bin and length. */
+function zeroRun(vs: number[]) {
+  const n = vs.length; let best = { k: 0, len: 0 };
+  if (vs.every((v) => v < 0.5)) return { k: 0, len: n };
+  for (let k = 0; k < n; k++) {
+    if (vs[k] >= 0.5 || vs[(k - 1 + n) % n] < 0.5) continue;
+    let len = 0; while (len < n && vs[(k + len) % n] < 0.5) len++;
+    if (len > best.len) best = { k, len };
+  }
+  return best;
+}
+const quarterOf = (a: number) => QUARTERS.reduce((b, q) => (Math.abs(wrap(a - q.c)) < Math.abs(wrap(a - b.c)) ? q : b));
+/**
+ * The ship's worst gap, called out: the widest arc nothing bears on is BLIND; else the widest arc missing a layer
+ * the ship does carry (NO AA / NO GROUND FIRE); else every bearing is covered and the quarter with the least fire is
+ * the thinnest. Arcs narrower than two bins are ignored (the seams between neighbouring fans).
+ */
+export function weakestQuarter(cov: Coverage): Gap {
+  const qs = quarters(cov), n = cov.n, bin = (Math.PI * 2) / n, tot = cov.air.map((v, k) => v + cov.ground[k]);
+  const mk = (run: { k: number; len: number }, severity: Gap['severity'], what: string): Gap => {
+    const c = run.len >= n ? Math.PI : wrap((run.k + (run.len - 1) / 2) * bin), q = quarterOf(c), qq = qs.find((x) => x.key === q.key)!;
+    return { key: q.key, name: q.name, label: `${what} ${q.name}`, severity, air: qq.air, ground: qq.ground, c, h: Math.min(Math.PI, (run.len * bin) / 2) };
+  };
+  for (const [vs, sev, what, any] of [[tot, 'blind', 'BLIND', true], [cov.air, 'gap', 'NO AA', cov.air.some((v) => v > 0)], [cov.ground, 'gap', 'NO GROUND FIRE', cov.ground.some((v) => v > 0)]] as const) {
+    if (!any) continue;
+    const r = zeroRun(vs as number[]); if (r.len >= 2) return mk(r, sev, what);
+  }
+  const t = qs.slice().sort((a, b) => a.air + a.ground - b.air - b.ground)[0];
+  return { key: t.key, name: t.name, label: `THINNEST ${t.name}`, severity: 'thin', air: t.air, ground: t.ground, c: t.c, h: Math.PI / 4 };
 }
 export interface Stat { key: string; label: string; v: number; text: string; /** Is a bigger number better? */ up: boolean }
 export function shipStats(d: Derived): Stat[] {
@@ -182,7 +287,8 @@ export const deriveOf = (b: Build, mods?: Mods) => derive(b, mods);
 /* ---------------- board layout ---------------- */
 
 export interface Anchor { id: string; ox: number; oy: number; si: number; i: number; /** On the bow section: the tile goes above the ship. */ bow: boolean }
-export interface BoardIn { w: number; h: number; len: number; width: number; anchors: Anchor[] }
+/** `lead` / `tail`: plan length drawn ahead of the first frame (the pointed bow) and behind the last (the stern), ship units. */
+export interface BoardIn { w: number; h: number; len: number; width: number; anchors: Anchor[]; lead?: number; tail?: number }
 export type Side = 'top' | 'left' | 'right' | 'list';
 export interface TilePos { id: string; side: Side; x: number; y: number; w: number; h: number; n: number }
 export interface Leader { id: string; pts: [number, number][] }
@@ -242,8 +348,8 @@ export function segmentHitsRect(p: [number, number], q: [number, number], r: { x
  * Narrow boards (phones) stack instead: ship on top, numbered tiles in a list below, numbered balloons on the hull.
  */
 export function layoutBoard(o: BoardIn): Board {
-  const { w, anchors } = o;
-  const len = Math.max(1, o.len), width = Math.max(1, o.width);
+  const { w, anchors } = o, lead = o.lead ?? 0, tail = o.tail ?? 0;
+  const len = Math.max(1, o.len + lead + tail), width = Math.max(1, o.width), off = (lead - tail) / 2;
   // Number the mounts bow to stern, port before starboard: the balloons on the hull and the tiles share it.
   const ord = anchors.slice().sort((a, b) => (a.bow === b.bow ? 0 : a.bow ? -1 : 1) || a.oy - b.oy || a.ox - b.ox);
   const num = new Map(ord.map((a, k) => [a.id, k + 1]));
@@ -251,7 +357,7 @@ export function layoutBoard(o: BoardIn): Board {
   if (w < STACK_BELOW) {
     const pad = 12, shipH = Math.min(Math.max(240, w * 0.95), 460);
     const s = Math.min((w - pad * 2) / width, (shipH - pad * 2) / len, 5);
-    const cx = w / 2, cy = shipH / 2;
+    const cx = w / 2, cy = shipH / 2 + off * s;
     const cols = w >= 420 ? 2 : 1, tw = (w - (cols - 1) * GAP) / cols, th = 54;
     const tiles: TilePos[] = ord.map((a, k) => ({ id: a.id, side: 'list', n: k + 1, w: tw, h: th, x: (k % cols) * (tw + GAP), y: shipH + 12 + Math.floor(k / cols) * (th + GAP) }));
     const rows = Math.ceil(ord.length / cols);
@@ -261,7 +367,7 @@ export function layoutBoard(o: BoardIn): Board {
   }
 
   const h = o.h;
-  const colW = Math.round(Math.min(236, Math.max(164, w * 0.215))), gutter = Math.round(Math.min(64, Math.max(30, w * 0.05)));
+  const colW = Math.round(Math.min(252, Math.max(176, w * 0.245))), gutter = Math.round(Math.min(64, Math.max(30, w * 0.05)));
   // Sides: port (ox < 0) left, starboard right; centreline mounts balance the columns, alternating at ties.
   const top = ord.filter((a) => a.bow), rest = ord.filter((a) => !a.bow);
   const left: Anchor[] = [], right: Anchor[] = [];
@@ -278,7 +384,7 @@ export function layoutBoard(o: BoardIn): Board {
   const topH = top.length ? tileH + 44 : 16;
   const ax0 = colW + gutter, ax1 = w - colW - gutter, ay0 = topH, ay1 = h - 14;
   const s = Math.min(((ax1 - ax0) * 0.96) / width, ((ay1 - ay0) * 0.96) / len, 5);
-  const cx = w / 2, cy = (ay0 + ay1) / 2;
+  const cx = w / 2, cy = (ay0 + ay1) / 2 + off * s;
   const an: Record<string, [number, number]> = {};
   for (const a of anchors) an[a.id] = [cx + a.ox * s, cy + a.oy * s];
 

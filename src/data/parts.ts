@@ -305,6 +305,18 @@ export function hullObstacles(rects: Rect[]): Obstacle[] {
   });
   return out;
 }
+/**
+ * The structures to draw from a hull's obstacles: towers and funnels as they are, a battery's hull box as its two
+ * sponsons (the casemates outboard of the hull beam). Plain module hull is not a structure. Kind 'hull' marks sponsons here.
+ */
+export function drawnObstacles(obstacles: Obstacle[]): Obstacle[] {
+  return obstacles.flatMap((o): Obstacle[] => {
+    if (o.kind === 'tower') return [o];
+    if (o.by !== 'battery') return [];
+    const hw = (o.hw * 2 - HULL_BEAM * SHIP_SCALE) / 2 + 2 * SHIP_SCALE;
+    return [-1, 1].map((sd) => ({ ...o, x: o.x + sd * (o.hw - hw), hw }));
+  });
+}
 /** The bearing range (ship space) an obstacle covers as seen from (x, y), or null if the point is inside it. */
 export function shadowOf(x: number, y: number, o: Obstacle): Sector | null {
   if (Math.abs(x - o.x) <= o.hw && Math.abs(y - o.y) <= o.hl) return null;
