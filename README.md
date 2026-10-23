@@ -2,7 +2,7 @@
 
 A vertical-scrolling shmup roguelite for the browser. You fly a flying battleship that you build one hull section at a time. You chart a route through each sector the way you would in Slay the Spire. At the end of every sector you fight a **ghost dreadnought**: the wreck of a real pilot who died there. When you die, your ship joins the pool and becomes someone else's boss.
 
-<p align="center"><img src="docs/readme/hero-ghost-broadside.jpg" width="900" alt="A ghost dreadnought comes alongside in its last phase and fires every gun it has; enemy fire is magenta, the player's missiles trail smoke across the harbour"></p>
+<p align="center"><img src="docs/readme/hero-ghost-broadside.jpg" width="900" alt="A ghost dreadnought comes alongside in its last phase and fires every gun it has; enemy fire is magenta, the player's missiles trail smoke across the gap"></p>
 
 ## Run it
 
@@ -26,9 +26,9 @@ For production, `npm start` builds the client and serves `dist/` and the API fro
 - **The world below.** Each sector flies over two of six biomes (night city, harbour, forest, snow mountains, desert, airbase) and crosses from one to the next mid-sector. Everything burns its own way: buildings collapse, tank farms chain-react, forests catch and spread, frozen lakes crack.
 - **True scale.** The ship is the size of a carrier and the enemies are true to scale: a tank is a speck of light beside the hull. A fire-control overlay boxes every contact with a NATO-style symbol, and the FLIR view shows them by their heat.
 - **Scrap** drops from destroyed enemies and structures, supply caches, wreckage and floating salvage canisters. Caches and wreckage sometimes drop repair kits. A magnet radius pulls scrap in.
-- **Your ship** is a stack of sections: bridge, gun decks, broadside batteries, armor, utility spines and engines. Where a gun sits decides what it can hit: the bow gun covers a forward cone, top-deck turrets only engage aircraft, broadsides cover their flank, bomb bays and mortars hit the ground below. You refit on a blueprint board by dragging parts onto sockets; the board lights the sockets that fit and draws the firing arc you would get.
+- **Your ship** is a long, sleek dreadnought built from modules on a grid: bridge (the pagoda tower), gun decks, broadside batteries, armor, utility spines and engines, under a clipper prow with funnels astern. Where a gun sits and which way it faces decide what it can hit: top-deck turrets only engage aircraft, broadsides cover their flank, bomb bays and mortars hit the ground below, and the hull blocks its own guns (a turret cannot fire through the bridge tower or a funnel). You refit on a blueprint board: drag parts onto sockets, drag whole modules around the plan (hammerheads and outriggers are legal), rotate a mount with R or the wheel, and buy better turret rings. A compare card shows what each change does, and a coverage rose calls out the weakest quarter ("NO AA ASTERN").
 - **Weapons**: pulse cannon, scatter laser, flak, seeker missiles, bomb bay, siege mortar, rail spine, arc coil and point defense, Mk I to Mk V. Light guns fire on their own; the heavy ones (rails, missiles, mortars, bombs) are numbered groups you aim with the mouse.
-- **Overdrive** charges as you destroy things. Each hull class has its own: the Vanguard's Ventral Lance, the Leviathan's Strike Wing, the Lance's spinal beam, the Bastion's Aegis.
+- **Overdrive** charges as you destroy things. Each hull class has its own: the Vanguard's Ventral Lance, the Leviathan's Strike Wing, the Lance's spinal beam, the Bastion's Aegis. Each Overdrive has an **upgrade tree**: pick one of its paths at tier 1 (it closes the others), then a refit at tier 2 and the path's capstone at tier 3. Sector bosses award a free commission; drydocks and merchants sell refits for scrap.
 - **Relics** are 22 passive modifiers, including curses picked up from risky choices.
 - **Death** uploads your exact build to the registry for the sector you died in. Bosses are drawn at random from everyone who died in that sector, preferring other pilots. If nobody has died there yet, a procedurally armed AI defense core holds it.
 - **The fleet.** Runs earn XP toward ten Admiralty ranks, which unlock three more hull classes and launch perks. There are standing orders (goals), a codex, heat levels after your first victory, and a **daily strike**: one seeded route a day for everyone, ranked on a shared duty roster.
@@ -46,8 +46,10 @@ For production, `npm start` builds the client and serves `dist/` and the API fro
 | Shift (hold) / T (toggle) | FLIR thermal view with a 4x zoom inset on the target |
 | P / Esc | Pause (audio mix, quality, screen shake) |
 | M | Mute |
+| R / Shift+R, wheel (refit board) | Rotate the hovered or focused mount |
+| U (refit board) | Buy a better turret ring for the mount, where the counter sells them |
 
-On a touch screen, drag to steer and every gun aims itself. In the refit board, drag (or press and hold on touch) a part onto a socket, between sockets to swap, or back to the hold; click-to-pick and the keyboard work too. Runs are saved after every node and can be continued from the title screen.
+On a touch screen, drag to steer and every gun aims itself. In the refit board, drag (or press and hold on touch) a part onto a socket, between sockets to swap, or back to the hold, and drag a module to a new spot on the plan; click-to-pick, the arrow keys on a module row and Delete work too. Runs are saved after every node and can be continued from the title screen.
 
 ## Screenshots
 
@@ -59,8 +61,12 @@ On a touch screen, drag to steer and every gun aims itself. In the refit board, 
 <td width="50%"><img src="docs/readme/route-map.jpg" alt="Sector route map"><br><sub><b>Route plot.</b> Hover a node to plot it. The ghost's dossier is pinned beside the map: the fallen pilot's wreck and everything it carried.</sub></td>
 </tr>
 <tr>
-<td><img src="docs/readme/refit-drag.jpg" alt="Refit board mid-drag"><br><sub><b>Refit board.</b> A rail spine carried over the port battery: weapon sockets light up, utility bays dim, and the plan draws the arc it would cover.</sub></td>
-<td><img src="docs/readme/merchant.jpg" alt="Merchant"><br><sub><b>Merchant.</b> Requisition slips, an insignia (relic), repairs and a counter for selling spares.</sub></td>
+<td><img src="docs/readme/refit-drag.jpg" alt="Refit board mid-drag"><br><sub><b>Refit board.</b> A rail spine carried over the port battery: weapon sockets light up, utility bays dim, the plan draws the arc and reach it would get, and the compare card lists NOW against NEW.</sub></td>
+<td><img src="docs/readme/refit-rotate.jpg" alt="Refit board rotating a mount"><br><sub><b>Facing and blocking.</b> Turning the top-deck flak forward: the hatched red wedge is the arc the bridge tower blocks. The coverage rose warns of NO AA ASTERN.</sub></td>
+</tr>
+<tr>
+<td><img src="docs/readme/overdrive-tree.jpg" alt="Overdrive upgrade tree"><br><sub><b>Overdrive refit.</b> The Ventral Lance's tree: Sweep is fitted, Pierce's path is closed, and a banked commission pays for Broad Swath or Burning Furrow.</sub></td>
+<td><img src="docs/readme/merchant.jpg" alt="Merchant"><br><sub><b>Merchant.</b> Requisition slips, an insignia (relic), repairs, the refit board, Overdrive refits and a counter for selling spares.</sub></td>
 </tr>
 <tr>
 <td><img src="docs/readme/signal.jpg" alt="Unknown signal event"><br><sub><b>Unknown signal.</b> One of eleven intercepts; some choices are bait.</sub></td>
@@ -80,20 +86,20 @@ On a touch screen, drag to steer and every gun aims itself. In the refit board, 
 
 <table>
 <tr>
-<td width="50%"><img src="docs/readme/combat-city.jpg" alt="Combat over the night city"><br><sub><b>Night city.</b> An armored column under fire: tactical boxes on every true-scale contact, the bow gun's cone, broadsides and missiles firing, and the salvo reticle.</sub></td>
-<td width="50%"><img src="docs/readme/missile-lock.jpg" alt="Missile lock"><br><sub><b>Missile lock.</b> Group 2 selected: lock brackets close on a helicopter and seeker pods arc out on smoke trails.</sub></td>
+<td width="50%"><img src="docs/readme/combat-city.jpg" alt="Combat over the night city"><br><sub><b>Night city.</b> The long hull over an armored column: tactical boxes on every true-scale contact, the bow gun's cone, the salvo reticle on a convoy, and an ASTERN cue for a threat behind.</sub></td>
+<td width="50%"><img src="docs/readme/missile-lock.jpg" alt="Missile lock"><br><sub><b>Missile lock.</b> Group 2 selected: LOCK brackets close on a helicopter, seeker pods arc out on smoke trails and a pulse battery tracks it.</sub></td>
 </tr>
 <tr>
 <td><img src="docs/readme/explosions.jpg" alt="Mortar and bomb salvo"><br><sub><b>Salvo.</b> Mortars and bombs on a fortress line: fireballs, burning blocks and smoke over the city.</sub></td>
-<td><img src="docs/readme/ventral-lance.jpg" alt="Ventral Lance overdrive"><br><sub><b>Ventral Lance.</b> The Vanguard's overdrive fires straight down from the keel; impact rings race out past the hull and the city lights up beneath it.</sub></td>
+<td><img src="docs/readme/ventral-lance.jpg" alt="Ventral Lance overdrive"><br><sub><b>Ventral Lance.</b> The Vanguard's Overdrive with the Sweep path and Twin Lances refits: three beams burn down from the keel and impact rings race out over the city.</sub></td>
 </tr>
 <tr>
-<td><img src="docs/readme/flir.jpg" alt="FLIR thermal view"><br><sub><b>FLIR.</b> Hold Shift: the city goes cool grey, engines and fires burn white, and a 4x inset shows the tank under the reticle.</sub></td>
-<td><img src="docs/readme/elite-crawler.jpg" alt="Siege Crawler elite"><br><sub><b>Elite.</b> A Siege Crawler gets a double box and a designator; the bow rail lances into it while its escorts fire back.</sub></td>
+<td><img src="docs/readme/flir.jpg" alt="FLIR thermal view"><br><sub><b>FLIR.</b> Hold Shift: the city goes cool grey, engines and fires burn white, and a 4x inset shows the target under the reticle.</sub></td>
+<td><img src="docs/readme/elite-crawler.jpg" alt="Siege Crawler elite"><br><sub><b>Elite.</b> A Siege Crawler gets a double box and a designator; a salvo bursts on it while its escorts fire back.</sub></td>
 </tr>
 <tr>
-<td><img src="docs/readme/ghost-telegraph.jpg" alt="Ghost dreadnought full broadside"><br><sub><b>Full broadside.</b> The ghost's last phase: rail telegraphs and every flank gun firing at once. Anything magenta can hit you.</sub></td>
-<td><img src="docs/readme/ghost-closeup.jpg" alt="Ghost dreadnought close-up"><br><sub><b>The ghost.</b> A fallen pilot's exact build, rebuilt as a derelict: soot, dead windows, a red rim and fires from its breached decks.</sub></td>
+<td><img src="docs/readme/ghost-telegraph.jpg" alt="Ghost dreadnought full broadside"><br><sub><b>Full broadside.</b> The ghost's last phase: telegraph lines and every flank gun firing at once. Anything magenta can hit you.</sub></td>
+<td><img src="docs/readme/ghost-closeup.jpg" alt="Ghost dreadnought close-up"><br><sub><b>The ghost.</b> A fallen pilot's exact build, rebuilt as a derelict: soot, dead windows, a red rim and fires from its breached decks (dev viewer).</sub></td>
 </tr>
 </table>
 
@@ -101,15 +107,15 @@ On a touch screen, drag to steer and every gun aims itself. In the refit board, 
 
 <table>
 <tr>
-<td width="50%"><img src="docs/readme/biome-harbour.jpg" alt="Iron Harbour"><br><sub><b>Iron Harbour.</b> Black water, pale quays and container stacks under sodium light.</sub></td>
+<td width="50%"><img src="docs/readme/biome-harbour.jpg" alt="Iron Harbour"><br><sub><b>Iron Harbour.</b> Black water and quay lights; a rail slug and a scatter fan go out over the docks.</sub></td>
 <td width="50%"><img src="docs/readme/biome-mountains.jpg" alt="White Range"><br><sub><b>White Range.</b> Moonlit ridges and a frozen lake; a rail slug lances up the valley.</sub></td>
 </tr>
 <tr>
-<td><img src="docs/readme/biome-desert.jpg" alt="Glass Desert"><br><sub><b>Glass Desert.</b> Dune swells, walled compounds and burning wreckage on the sand.</sub></td>
+<td><img src="docs/readme/biome-desert.jpg" alt="Glass Desert"><br><sub><b>Glass Desert.</b> Dune swells and burning wreckage on the sand; a searchlight sweeps the sky.</sub></td>
 <td><img src="docs/readme/biome-forest.jpg" alt="Deepwood"><br><sub><b>Deepwood.</b> Bombs and mortar shells on the canopy start wildfires that spread through the trees.</sub></td>
 </tr>
 <tr>
-<td colspan="2"><img src="docs/readme/ship-closeup.jpg" alt="Dreadnought close-up"><br><sub><b>Up close</b> (dev viewer, <code>/tools/ship.html</code>). The bridge stack, barbettes and deck machinery: every hull section is seeded greebles, and every gun is a cluster of small turrets dressed by its traverse.</sub></td>
+<td colspan="2"><img src="docs/readme/ship-closeup.jpg" alt="Dreadnought close-up"><br><sub><b>Up close</b> (dev viewer, <code>/tools/ship.html</code>). The long hull on its module grid: clipper prow, battery sponsons, the pagoda bridge tower, capital turrets on ring collars and a funnel astern. Every module is seeded deck machinery.</sub></td>
 </tr>
 </table>
 
@@ -124,7 +130,7 @@ On a touch screen, drag to steer and every gun aims itself. In the refit board, 
 | `src/game/meta.ts`, `metaScreens.ts` | Profile, Admiralty rank, goals, codex, heat; launch panel, Admiralty, wreck report, victory |
 | `src/game/worldgen.ts`, `biomegen.ts`, `biomes.ts`, `terrain.ts` | The six biomes: structures, set pieces, terrain fields, destruction and wildfire |
 | `src/game/vfx.ts`, `feel.ts` | Pooled particles, camera trauma, hitstop and slow-motion |
-| `src/data/` | Parts and hull sections, hull classes, enemies and encounters, relics, events, goals, heat |
+| `src/data/` | Parts, hull modules and the module grid, hull classes, Overdrive upgrade trees, enemies and encounters, relics, events, goals, heat |
 | `src/render/engine.ts`, `view.ts` | Three.js renderer, camera and layers; field-to-screen mapping |
 | `src/render/ship/` | Procedural dreadnought hulls, greebles, turrets, utilities, lights, the ghost livery, the dev viewer |
 | `src/render/units/` | True-scale enemy models, livery, tactical symbology |
