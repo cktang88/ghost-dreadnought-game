@@ -17,6 +17,10 @@ export interface DragHooks {
   drop: (target: HTMLElement | null) => (() => void) | null;
   /** Always called last: dropped, refused or cancelled. */
   end: () => void;
+  /** Every pointer move while carrying (client coordinates): for drops that land on a spot, not an element. */
+  move?: (x: number, y: number) => void;
+  /** Where a committed drop snaps to (client rect); defaults to the target element. */
+  snapTo?: () => DOMRect | null;
 }
 
 let active: { cancel: () => void } | null = null;
@@ -40,7 +44,9 @@ export function draggable(src: HTMLElement, hooks: () => DragHooks | null) {
       const r = src.getBoundingClientRect();
       ghost = h.ghost ? h.ghost() : (src.cloneNode(true) as HTMLElement);
       ghost.classList.add('dnd-ghost'); ghost.removeAttribute('id'); ghost.setAttribute('aria-hidden', 'true');
-      Object.assign(ghost.style, { position: 'fixed', left: '0', top: '0', transformOrigin: '0 0', width: `${r.width}px`, height: `${r.height}px`, margin: '0', pointerEvents: 'none', zIndex: '1000' });
+      // A ghost marked data-own-size keeps its own size (a label carried off a big source, like a module off the plan).
+      const own = ghost.hasAttribute('data-own-size');
+      Object.assign(ghost.style, { position: 'fixed', left: '0', top: '0', transformOrigin: '0 0', ...(own ? {} : { width: `${r.width}px`, height: `${r.height}px` }), margin: '0', pointerEvents: 'none', zIndex: '1000' });
       document.body.append(ghost);
       src.classList.add('dnd-src'); document.body.classList.add('dnd-on');
       active = { cancel: () => finish(null, true) };
@@ -57,6 +63,7 @@ export function draggable(src: HTMLElement, hooks: () => DragHooks | null) {
       const under = document.elementFromPoint(x, y) as HTMLElement | null;
       const t = (under?.closest('[data-drop]') as HTMLElement | null) ?? null;
       if (t !== target) { target = t; h?.over(t); }
+      h?.move?.(x, y);
     };
     // Near the top or bottom edge of the scroller the page scrolls under the carried tile (phones: hold below the board).
     let scroller: HTMLElement | null = null, raf = 0;
@@ -100,7 +107,7 @@ export function draggable(src: HTMLElement, hooks: () => DragHooks | null) {
       setTimeout(() => window.removeEventListener('click', swallowClick, { capture: true }), 0);
       const commit = cancelled ? null : hk.drop(t);
       const still = prefersReducedMotion();
-      const to = commit && t ? t.getBoundingClientRect() : src.isConnected ? src.getBoundingClientRect() : null;
+      const to = commit && hk.snapTo ? hk.snapTo() : commit && t ? t.getBoundingClientRect() : src.isConnected ? src.getBoundingClientRect() : null;
       const done = () => { g.remove(); src.classList.remove('dnd-src'); document.body.classList.remove('dnd-on'); if (commit) commit(); hk.end(); };
       if (!to || still) { done(); return; }
       // Snap: the tile drops square into the socket (fast, slight overshoot), or springs home when refused.

@@ -1,9 +1,11 @@
 // Pure logic behind the refit board (src/ui/refit.ts): where each socket tile sits around the ship and how its
 // leader line runs to the mount, what a drag would do (valid or not, and why), and the stat deltas it previews.
 // No DOM here, so tests/unit/refitBoard.test.ts can hold the layout to "no overlaps, no crossed leaders".
+import { SHIP_SCALE } from '../game/field';
 import {
-  SECTIONS, derive, isWeapon, layersHit, partDef, partSlot, wCd, wDmg,
-  type Build, type Derived, type Mods, type Part, type SlotKind,
+  SECTIONS, GRID, MAX_SECTIONS, RING_MAX, attachSpots, canPlace, derive, facingMatters, isWeapon, layersHit, layoutIssue, layoutOf, mountArc, mountFacing, mountRing, mountTraverse,
+  mountRange, nextFacing, partDef, partSlot, pinLayout, ringCost, traverseIn, wCd, wDmg,
+  type Arc, type Blocked, type Build, type Derived, type Facing, type Mods, type Mount, type Part, type Sector, type SectionType, type SlotKind, type TargetLayers,
 } from '../data/parts';
 
 /* ---------------- moves ---------------- */
@@ -60,7 +62,9 @@ export function applyMove(b: Build, inv: Part[], src: Src, dst: Dst) {
   else { inv.splice(src.i, 1); if (cur) inv.push(cur); sec.slots[dst.i] = p; }
 }
 
-const cloneBuild = (b: Build): Build => ({ sections: b.sections.map((s) => ({ type: s.type, slots: s.slots.slice() })) });
+const cloneBuild = (b: Build): Build => ({ sections: b.sections.map((s) => ({
+  type: s.type, slots: s.slots.slice(), ...(s.face ? { face: s.face.slice() } : {}), ...(s.ring ? { ring: s.ring.slice() } : {}), ...(s.at ? { at: [s.at[0], s.at[1]] as [number, number] } : {}),
+})) });
 /** The build a move would leave (for previews); the real build is untouched. */
 export function previewMove(b: Build, inv: Part[], src: Src, dst: Dst): Build | null {
   if (!checkMove(b, inv, src, dst).ok) return null;
@@ -71,13 +75,13 @@ export function previewMove(b: Build, inv: Part[], src: Src, dst: Dst): Build | 
   return nb;
 }
 
-/** Hull section order: the bridge stays at the bow; any other section may move to any position behind it. */
+/**
+ * Hull section order: any section, the bridge too, may move to any position. Order decides where every mount sits along
+ * the keel, so what the bridge tower, funnels and sponsons block (hullShadows in data/parts.ts).
+ */
 export function canMoveSection(b: Build, from: number, to: number) {
   const n = b.sections.length;
-  if (from === to || from < 0 || from >= n || to < 0 || to >= n) return false;
-  if (b.sections[from].type === 'bridge') return false;
-  const bridgeAt = b.sections.findIndex((s) => s.type === 'bridge');
-  return bridgeAt < 0 || to > bridgeAt || (to === bridgeAt && from < bridgeAt);
+  return from !== to && from >= 0 && from < n && to >= 0 && to < n;
 }
 /** Move a section to position `to` (insertion, the others close up). Call inside changeBuild(). */
 export function moveSection(b: Build, from: number, to: number) {
@@ -86,8 +90,45 @@ export function moveSection(b: Build, from: number, to: number) {
   return true;
 }
 export function previewSectionMove(b: Build, from: number, to: number) { const nb = cloneBuild(b); return moveSection(nb, from, to) ? nb : null; }
+/** Turn a weapon mount to its next allowed facing (dir 1 clockwise, -1 anticlockwise). Call inside changeBuild(). */
+export function rotateMount(b: Build, si: number, i: number, dir: 1 | -1) {
+  const s = b.sections[si]; if (!s) return false;
+  const f = nextFacing(s, i, dir); if (f === null) return false;
+  const face = SECTIONS[s.type].slots.map((_, k) => mountFacing(s, k) as number);
+  face[i] = f; s.face = face;
+  return true;
+}
+export function previewRotate(b: Build, si: number, i: number, dir: 1 | -1) { const nb = cloneBuild(b); return rotateMount(nb, si, i, dir) ? nb : null; }
+/** The scrap a ring refit of mount (si, i) to the next level costs, or null at the best ring / not a weapon mount. */
+export function ringUpgradeCost(b: Build, si: number, i: number): number | null {
+  const s = b.sections[si]; if (!s || SECTIONS[s.type].slots[i] !== 'W') return null;
+  const lv = mountRing(s, i);
+  return lv >= RING_MAX ? null : ringCost(lv + 1);
+}
+/** Fit the next turret ring to mount (si, i) (the caller pays ringUpgradeCost). Call inside changeBuild(). */
+export function upgradeRing(b: Build, si: number, i: number) {
+  if (ringUpgradeCost(b, si, i) === null) return false;
+  const s = b.sections[si];
+  s.ring = SECTIONS[s.type].slots.map((_, k) => mountRing(s, k));
+  s.ring[i] = mountRing(s, i) + 1;
+  return true;
+}
+/** Move module si to grid spot `at` (design units; the rest of the ship is pinned where it is). Call inside changeBuild(). */
+export function placeModule(b: Build, si: number, at: [number, number]) {
+  if (!b.sections[si] || canPlace(b, si, at)) return false;
+  pinLayout(b); b.sections[si].at = at;
+  return true;
+}
+/** The build with the next turret ring fitted to mount (si, i), for previews. */
+export function previewRing(b: Build, si: number, i: number) { const nb = cloneBuild(b); return upgradeRing(nb, si, i) ? nb : null; }
+export function previewPlace(b: Build, si: number, at: [number, number]) { const nb = cloneBuild(b); return placeModule(nb, si, at) ? nb : null; }
 /** Cutting a section loose: never the bridge; its parts land in the hold. Call inside changeBuild(). */
-export const canCutSection = (b: Build, si: number) => !!b.sections[si] && b.sections[si].type !== 'bridge';
+export function canCutSection(b: Build, si: number) {
+  if (!b.sections[si] || b.sections[si].type === 'bridge') return false;
+  // On a placed grid the rest must stay one joined hull.
+  const lay = layoutOf(b);
+  return !b.sections.some((s) => s.at) || !layoutIssue({ sections: b.sections.filter((_, k) => k !== si) }, lay.filter((_, k) => k !== si));
+}
 export function cutSection(b: Build, inv: Part[], si: number) {
   if (!canCutSection(b, si)) return null;
   const [s] = b.sections.splice(si, 1);
@@ -103,19 +144,123 @@ export function previewCut(b: Build, si: number) { const nb = cloneBuild(b); ret
  * (a top-deck gun cannot reach the ground). A nominal figure for comparing fits, not a combat simulation:
  * scatter fans and paired pods count every bolt, flak counts two aircraft per burst, reactor and relic bonuses apply.
  */
+export function mountDps(d: Derived, m: Mount) {
+  const p = m.part, out = { air: 0, ground: 0, pd: 0 };
+  if (!p || !isWeapon(p.id)) return out;
+  if (p.id === 'pd') { out.pd = (1 / wCd(p)) * d.fireMult; return out; }
+  // Every bolt of a scatter fan and both seeker pods count; a flak burst is rated as catching two aircraft.
+  const shots = p.id === 'spread' ? (p.tier >= 3 ? 5 : 3) : p.id === 'missile' || p.id === 'flak' ? 2 : 1;
+  const dps = (wDmg(p) / wCd(p)) * shots * d.fireMult;
+  if (m.trav.sectors.length && layersHit(m.trav.layers, 'air')) out.air = dps * d.mods.dmgAir;
+  if (m.trav.sectors.length && layersHit(m.trav.layers, 'ground')) out.ground = dps * d.mods.dmgGround;
+  return out;
+}
 export function firepower(d: Derived) {
   let air = 0, ground = 0, pd = 0;
-  for (const m of d.mounts) {
-    const p = m.part;
-    if (!p || !isWeapon(p.id)) continue;
-    // Every bolt of a scatter fan and both seeker pods count; a flak burst is rated as catching two aircraft.
-    const shots = p.id === 'spread' ? (p.tier >= 3 ? 5 : 3) : p.id === 'missile' || p.id === 'flak' ? 2 : 1;
-    if (p.id === 'pd') { pd += (1 / wCd(p)) * d.fireMult; continue; }
-    const dps = (wDmg(p) / wCd(p)) * shots * d.fireMult;
-    if (layersHit(m.trav.layers, 'air')) air += dps * d.mods.dmgAir;
-    if (layersHit(m.trav.layers, 'ground')) ground += dps * d.mods.dmgGround;
-  }
+  for (const m of d.mounts) { const f = mountDps(d, m); air += f.air; ground += f.ground; pd += f.pd; }
   return { air, ground, pd };
+}
+
+/* ---------------- facing, masked arcs and the coverage rose ---------------- */
+
+/** Arrow glyph per facing (bow up the page). */
+export const FACING_ARROW = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'] as const;
+/** What blocks a gun, in drawing-callout words. */
+export const BLOCK_NAME: Record<SectionType, string> = { bridge: 'BRIDGE TOWER', engine: 'FUNNEL', battery: 'SPONSON', gundeck: 'GUN DECK', armor: 'ARMOR', spine: 'SPINE' };
+const wrap = (a: number) => { a = (a + Math.PI) % (Math.PI * 2); if (a < 0) a += Math.PI * 2; return a - Math.PI; };
+/** Is ship bearing `a` inside any sector? */
+export const bears = (ss: Sector[], a: number) => ss.some((s) => Math.abs(wrap(a - s.c)) <= s.h + 1e-9);
+/** Why mount (si, i) cannot be rotated with what is in it, or null when it can. */
+export function rotateWhy(b: Build, si: number, i: number): string | null {
+  const s = b.sections[si]; if (!s) return 'No such mount.';
+  const k = SECTIONS[s.type].slots[i];
+  if (k !== 'W') return 'Utility bays sit inside the hull: no facing.';
+  const arc = mountArc(s.type, k, s.slots[i]?.id);
+  if (arc === 'ventral') return 'Bombs and mortars drop from the belly: facing does not matter.';
+  if (arc === 'omni') return 'All-round weapon: facing does not matter.';
+  if (!facingMatters(arc) || nextFacing(s, i, 1) === null) return 'Fixed mount.';
+  return null;
+}
+/** Intersection of two sector lists (bearings both cover), trying every turn of the circle. */
+export function intersectSectors(a: Sector[], b: Sector[]): Sector[] {
+  const out: Sector[] = [];
+  for (const x of a) for (const y of b) for (const k of [-2 * Math.PI, 0, 2 * Math.PI]) {
+    const lo = Math.max(x.c - x.h, y.c - y.h + k), hi = Math.min(x.c + x.h, y.c + y.h + k);
+    if (hi - lo > 0.01) out.push({ c: wrap((lo + hi) / 2), h: (hi - lo) / 2 });
+  }
+  return out;
+}
+/** A mount's arc as the board draws it: the open (masked) sectors, and the blocked wedges clipped to its facing's arc. */
+export interface ArcView { arc: Arc; facing: Facing; open: Sector[]; blocked: Blocked[]; layers: TargetLayers; down: boolean; /** Reach, field units. */ range: number; ring: number }
+/** The arc of mount (si, i) with `partId` in it (default: the part it holds; null: empty), as derived hull `d` masks it. */
+export function arcView(d: Derived, si: number, i: number, partId?: string | null): ArcView | null {
+  const m = d.mounts.find((x) => x.si === si && x.i === i); if (!m) return null;
+  const pid = partId === undefined ? m.part?.id ?? null : partId, type = d.rects[si].type;
+  const t = traverseIn(d, si, i, pid), raw = mountTraverse(type, m.kind, pid, m.facing);
+  const blocked = t.blocked.flatMap((b) => intersectSectors(raw.sectors, [b]).map((s) => ({ ...s, by: b.by })));
+  return { arc: t.arc, facing: m.facing, open: t.sectors, blocked, layers: t.layers, down: t.down, range: mountRange(t.arc, pid), ring: m.ring };
+}
+/** Total angle (radians) covered by sectors. */
+export const sweep = (ss: Sector[]) => ss.reduce((n, s) => n + Math.min(Math.PI, s.h) * 2, 0);
+
+/** Bearings sampled by the coverage rose (bin k is centred on k · 2π / n, clockwise from the bow). */
+export const ROSE_BINS = 36;
+export interface Coverage { n: number; air: number[]; ground: number[] }
+/** Rated dmg/s bearing on each bearing: every mount whose masked traverse includes it (ventral ordnance all round). */
+export function coverage(d: Derived, n = ROSE_BINS): Coverage {
+  const air = new Array<number>(n).fill(0), ground = new Array<number>(n).fill(0);
+  for (const m of d.mounts) {
+    const f = mountDps(d, m); if (!f.air && !f.ground) continue;
+    for (let k = 0; k < n; k++) if (bears(m.trav.sectors, wrap((k * 2 * Math.PI) / n))) { air[k] += f.air; ground[k] += f.ground; }
+  }
+  return { n, air, ground };
+}
+export type QuarterKey = 'fore' | 'stbd' | 'aft' | 'port';
+export const QUARTERS: { key: QuarterKey; c: number; name: string; short: string }[] = [
+  { key: 'fore', c: 0, name: 'AHEAD', short: 'FWD' }, { key: 'stbd', c: Math.PI / 2, name: 'TO STARBOARD', short: 'STBD' },
+  { key: 'aft', c: Math.PI, name: 'ASTERN', short: 'AFT' }, { key: 'port', c: -Math.PI / 2, name: 'TO PORT', short: 'PORT' },
+];
+/** Mean air and ground dmg/s over each quarter of the compass. */
+export function quarters(cov: Coverage) {
+  return QUARTERS.map((q) => {
+    let air = 0, ground = 0, n = 0;
+    for (let k = 0; k < cov.n; k++) if (Math.abs(wrap((k * 2 * Math.PI) / cov.n - q.c)) < Math.PI / 4 + 1e-9) { air += cov.air[k]; ground += cov.ground[k]; n++; }
+    return { ...q, air: air / Math.max(1, n), ground: ground / Math.max(1, n) };
+  });
+}
+export interface Gap {
+  key: QuarterKey; name: string; label: string; severity: 'blind' | 'gap' | 'thin'; air: number; ground: number;
+  /** The gap itself as a ship-space sector (the whole quarter when nothing is missing). */ c: number; h: number;
+}
+/** Longest run of bins (wrapping) where `vs` is zero: start bin and length. */
+function zeroRun(vs: number[]) {
+  const n = vs.length; let best = { k: 0, len: 0 };
+  if (vs.every((v) => v < 0.5)) return { k: 0, len: n };
+  for (let k = 0; k < n; k++) {
+    if (vs[k] >= 0.5 || vs[(k - 1 + n) % n] < 0.5) continue;
+    let len = 0; while (len < n && vs[(k + len) % n] < 0.5) len++;
+    if (len > best.len) best = { k, len };
+  }
+  return best;
+}
+const quarterOf = (a: number) => QUARTERS.reduce((b, q) => (Math.abs(wrap(a - q.c)) < Math.abs(wrap(a - b.c)) ? q : b));
+/**
+ * The ship's worst gap, called out: the widest arc nothing bears on is BLIND; else the widest arc missing a layer
+ * the ship does carry (NO AA / NO GROUND FIRE); else every bearing is covered and the quarter with the least fire is
+ * the thinnest. Arcs narrower than two bins are ignored (the seams between neighbouring fans).
+ */
+export function weakestQuarter(cov: Coverage): Gap {
+  const qs = quarters(cov), n = cov.n, bin = (Math.PI * 2) / n, tot = cov.air.map((v, k) => v + cov.ground[k]);
+  const mk = (run: { k: number; len: number }, severity: Gap['severity'], what: string): Gap => {
+    const c = run.len >= n ? Math.PI : wrap((run.k + (run.len - 1) / 2) * bin), q = quarterOf(c), qq = qs.find((x) => x.key === q.key)!;
+    return { key: q.key, name: q.name, label: `${what} ${q.name}`, severity, air: qq.air, ground: qq.ground, c, h: Math.min(Math.PI, (run.len * bin) / 2) };
+  };
+  for (const [vs, sev, what, any] of [[tot, 'blind', 'BLIND', true], [cov.air, 'gap', 'NO AA', cov.air.some((v) => v > 0)], [cov.ground, 'gap', 'NO GROUND FIRE', cov.ground.some((v) => v > 0)]] as const) {
+    if (!any) continue;
+    const r = zeroRun(vs as number[]); if (r.len >= 2) return mk(r, sev, what);
+  }
+  const t = qs.slice().sort((a, b) => a.air + a.ground - b.air - b.ground)[0];
+  return { key: t.key, name: t.name, label: `THINNEST ${t.name}`, severity: 'thin', air: t.air, ground: t.ground, c: t.c, h: Math.PI / 4 };
 }
 export interface Stat { key: string; label: string; v: number; text: string; /** Is a bigger number better? */ up: boolean }
 export function shipStats(d: Derived): Stat[] {
@@ -142,10 +287,99 @@ export function statDeltas(a: Derived, b: Derived): Record<string, { d: number; 
 }
 export const deriveOf = (b: Build, mods?: Mods) => derive(b, mods);
 
+/* ---------------- module grid on the board ---------------- */
+
+const snapG = (v: number) => Math.round(v / GRID) * GRID || 0; // never -0
+/** A copy of the build with every module pinned where it sits now (so the others hold still while one moves). */
+const pinned = (b: Build) => { const nb = cloneBuild(b); pinLayout(nb); return nb; };
+/**
+ * The field-unit offset derive() took off to centre the ship on its bounding box: field = design · SHIP_SCALE − off.
+ * The board keeps the current ship's offset while a module is dragged, so the plan holds still under the pointer.
+ */
+export function planOffset(b: Build, d: Derived): [number, number] {
+  if (!b.sections.length || !d.rects.length) return [0, 0];
+  const at = layoutOf(b)[0], t = SECTIONS[b.sections[0].type];
+  return [(at[0] - t.w / 2) * SHIP_SCALE - d.rects[0].x, at[1] * SHIP_SCALE - d.rects[0].y];
+}
+/** The grid spot (design units, snapped) for a module of `type` centred on field point (fx, fy) of a ship offset by `off`. */
+export const spotAt = (type: SectionType, fx: number, fy: number, off: [number, number]): [number, number] =>
+  [snapG((fx + off[0]) / SHIP_SCALE), snapG((fy + off[1]) / SHIP_SCALE - SECTIONS[type].h / 2)];
+/** Field-unit box (centred like derive's rects) of a module of `type` at grid spot `at`. */
+export const spotBox = (type: SectionType, at: [number, number], off: [number, number]) => {
+  const t = SECTIONS[type];
+  return { x: (at[0] - t.w / 2) * SHIP_SCALE - off[0], y: at[1] * SHIP_SCALE - off[1], w: t.w * SHIP_SCALE, h: t.h * SHIP_SCALE };
+};
+/** The module being placed: an existing one (`si`), or a new one of `type` about to be bought (si = -1). */
+export interface Placing { si: number; type: SectionType }
+/** Why the module cannot go to `at`, or null if it can. */
+export function placeIssue(b: Build, p: Placing, at: [number, number]): string | null {
+  if (p.si >= 0) return canPlace(b, p.si, at);
+  if (b.sections.length >= MAX_SECTIONS) return 'No berth: the hull is at its eight modules.';
+  return layoutIssue({ sections: [...b.sections, { type: p.type, slots: [] }] }, [...layoutOf(b), [snapG(at[0]), snapG(at[1])]]);
+}
+/** Every legal spot for the module: flush against an edge of any other module (attachSpots), plus where it is now. */
+export function placeSpots(b: Build, p: Placing): [number, number][] {
+  const lay = layoutOf(b), rest = pinned(b);
+  if (p.si >= 0) rest.sections.splice(p.si, 1);
+  const out = attachSpots(rest, p.type).filter((at) => !placeIssue(b, p, at));
+  if (p.si >= 0 && !out.some((a) => a[0] === lay[p.si][0] && a[1] === lay[p.si][1])) out.push(lay[p.si]);
+  return out;
+}
+export interface Drop { at: [number, number]; ok: boolean; why: string | null; snapped: boolean }
+/** Where a drag at `raw` lands: the nearest legal spot within `snapR` design units, else `raw` itself (legal or with the reason it is not). */
+export function dropSpot(b: Build, p: Placing, raw: [number, number], spots = placeSpots(b, p), snapR = 16): Drop {
+  let best: [number, number] | null = null, bd = snapR * snapR;
+  for (const s of spots) { const d = (s[0] - raw[0]) ** 2 + (s[1] - raw[1]) ** 2; if (d <= bd) { bd = d; best = s; } }
+  if (best) return { at: best, ok: true, why: null, snapped: true };
+  const why = placeIssue(b, p, raw);
+  return { at: raw, ok: !why, why, snapped: false };
+}
+/** The build with the module at `at` (a new module is added empty), for previews; null if it cannot go there. */
+export function previewPlacing(b: Build, p: Placing, at: [number, number]): Build | null {
+  if (p.si >= 0) return previewPlace(b, p.si, at);
+  if (placeIssue(b, p, at)) return null;
+  const nb = pinned(b); nb.sections.push({ type: p.type, slots: SECTIONS[p.type].slots.map(() => null), at: [snapG(at[0]), snapG(at[1])] });
+  return nb;
+}
+/** Keyboard nudge: the next legal spot for module si stepping (dx, dy) grid steps at a time, or null if there is none nearby. */
+export function nudgeSpot(b: Build, si: number, dx: number, dy: number, maxSteps = 60): [number, number] | null {
+  const cur = layoutOf(b)[si]; if (!cur) return null;
+  for (let k = 1; k <= maxSteps; k++) { const at: [number, number] = [cur[0] + dx * GRID * k, cur[1] + dy * GRID * k]; if (!canPlace(b, si, at)) return at; }
+  return null;
+}
+
+/* ---------------- compare cards ---------------- */
+
+/** One mount as the compare card reads it. `arc` is the clear arc in degrees after blocking (null: facing does not matter). */
+export interface MountCard { name: string; tier: number; air: number; ground: number; cd: number | null; range: number; arc: number | null; layers: TargetLayers; ring: number; arcKind: Arc }
+export function mountCard(d: Derived, si: number, i: number): MountCard | null {
+  const m = d.mounts.find((x) => x.si === si && x.i === i); if (!m) return null;
+  const p = m.part, f = mountDps(d, m);
+  return {
+    name: p ? partDef(p.id).name : m.kind === 'W' ? 'Empty mount' : 'Empty bay', tier: p?.tier ?? 0, air: f.air, ground: f.ground,
+    cd: p && isWeapon(p.id) ? wCd(p) / d.fireMult : null, range: m.range, arc: facingMatters(m.arc) ? Math.round((sweep(m.trav.sectors) * 180) / Math.PI) : null,
+    layers: p && isWeapon(p.id) ? m.trav.layers : 'none', ring: m.ring, arcKind: m.arc,
+  };
+}
+/** Ship totals for the compare card. */
+export function shipCard(d: Derived) {
+  const f = firepower(d), gap = weakestQuarter(coverage(d));
+  return { hull: d.maxHp, speed: Math.round(d.speed), air: Math.round(f.air), ground: Math.round(f.ground), gap };
+}
+/** Severity rank of a coverage gap (higher is worse), to colour a change of gap. */
+export const gapRank = (g: Gap) => (g.severity === 'blind' ? 3 : g.severity === 'gap' ? 2 : 1) + g.h / 10;
+
+/** Board anchors: every mount where it sits. The bridge gun is called out above the ship only when it is the foremost mount. */
+export function anchorsFor(d: Derived): Anchor[] {
+  const top = Math.min(...d.mounts.map((m) => m.oy));
+  return d.mounts.map((m) => ({ id: `${m.si}-${m.i}`, ox: m.ox, oy: m.oy, si: m.si, i: m.i, bow: d.rects[m.si].type === 'bridge' && m.oy <= top + 1 }));
+}
+
 /* ---------------- board layout ---------------- */
 
 export interface Anchor { id: string; ox: number; oy: number; si: number; i: number; /** On the bow section: the tile goes above the ship. */ bow: boolean }
-export interface BoardIn { w: number; h: number; len: number; width: number; anchors: Anchor[] }
+/** `lead` / `tail`: plan length drawn ahead of the first frame (the pointed bow) and behind the last (the stern), ship units. */
+export interface BoardIn { w: number; h: number; len: number; width: number; anchors: Anchor[]; lead?: number; tail?: number }
 export type Side = 'top' | 'left' | 'right' | 'list';
 export interface TilePos { id: string; side: Side; x: number; y: number; w: number; h: number; n: number }
 export interface Leader { id: string; pts: [number, number][] }
@@ -205,8 +439,8 @@ export function segmentHitsRect(p: [number, number], q: [number, number], r: { x
  * Narrow boards (phones) stack instead: ship on top, numbered tiles in a list below, numbered balloons on the hull.
  */
 export function layoutBoard(o: BoardIn): Board {
-  const { w, anchors } = o;
-  const len = Math.max(1, o.len), width = Math.max(1, o.width);
+  const { w, anchors } = o, lead = o.lead ?? 0, tail = o.tail ?? 0;
+  const len = Math.max(1, o.len + lead + tail), width = Math.max(1, o.width), off = (lead - tail) / 2;
   // Number the mounts bow to stern, port before starboard: the balloons on the hull and the tiles share it.
   const ord = anchors.slice().sort((a, b) => (a.bow === b.bow ? 0 : a.bow ? -1 : 1) || a.oy - b.oy || a.ox - b.ox);
   const num = new Map(ord.map((a, k) => [a.id, k + 1]));
@@ -214,7 +448,7 @@ export function layoutBoard(o: BoardIn): Board {
   if (w < STACK_BELOW) {
     const pad = 12, shipH = Math.min(Math.max(240, w * 0.95), 460);
     const s = Math.min((w - pad * 2) / width, (shipH - pad * 2) / len, 5);
-    const cx = w / 2, cy = shipH / 2;
+    const cx = w / 2, cy = shipH / 2 + off * s;
     const cols = w >= 420 ? 2 : 1, tw = (w - (cols - 1) * GAP) / cols, th = 54;
     const tiles: TilePos[] = ord.map((a, k) => ({ id: a.id, side: 'list', n: k + 1, w: tw, h: th, x: (k % cols) * (tw + GAP), y: shipH + 12 + Math.floor(k / cols) * (th + GAP) }));
     const rows = Math.ceil(ord.length / cols);
@@ -224,7 +458,7 @@ export function layoutBoard(o: BoardIn): Board {
   }
 
   const h = o.h;
-  const colW = Math.round(Math.min(236, Math.max(164, w * 0.215))), gutter = Math.round(Math.min(64, Math.max(30, w * 0.05)));
+  const colW = Math.round(Math.min(252, Math.max(176, w * 0.245))), gutter = Math.round(Math.min(64, Math.max(30, w * 0.05)));
   // Sides: port (ox < 0) left, starboard right; centreline mounts balance the columns, alternating at ties.
   const top = ord.filter((a) => a.bow), rest = ord.filter((a) => !a.bow);
   const left: Anchor[] = [], right: Anchor[] = [];
@@ -241,7 +475,7 @@ export function layoutBoard(o: BoardIn): Board {
   const topH = top.length ? tileH + 44 : 16;
   const ax0 = colW + gutter, ax1 = w - colW - gutter, ay0 = topH, ay1 = h - 14;
   const s = Math.min(((ax1 - ax0) * 0.96) / width, ((ay1 - ay0) * 0.96) / len, 5);
-  const cx = w / 2, cy = (ay0 + ay1) / 2;
+  const cx = w / 2, cy = (ay0 + ay1) / 2 + off * s;
   const an: Record<string, [number, number]> = {};
   for (const a of anchors) an[a.id] = [cx + a.ox * s, cy + a.oy * s];
 

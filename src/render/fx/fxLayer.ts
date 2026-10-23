@@ -282,13 +282,25 @@ export class FxLayer implements Layer {
       A.add(a.x, a.y, a.z, 0, 1500 * (0.8 + 0.2 * fl), 40, c, 2.2, FxShape.Flare, 0.45 * I);
       A.add(a.x, a.y, a.z, Math.PI / 2, 360 * fl, 18, c, 1.6, FxShape.Flare, 0.3 * I);
       addFx({ type: 'light', x: b.x2, y: b.y2, life: 0.05, max: 0.05, size: 720, str: 60, col: b.col, ground: true });
+      // upgrade beams (Twin Lances): their own glare, core and keel spark, smaller
+      for (const x of o.extra ?? []) {
+        e.toGround(x.x2, x.y2, v);
+        G.add(v.x, 4, v.z, 0, x.w * 4 * k, x.w * 4 * k, c, 1.4, FxShape.Soft, 0.6 * I);
+        G.add(v.x, 5, v.z, 0, x.w * 2.4 * k, x.w * 2.4 * k, WHITE, 3, FxShape.Hot, 0.9 * I);
+        const rr = (t * 2.1) % 1; G.add(v.x, 3, v.z, 0, x.w * (2 + 5 * rr) * k, x.w * (2 + 5 * rr) * k, c, 3, FxShape.Ring, (1 - rr) * I, 0.05);
+        G.add(v.x, 5, v.z, t * 6, x.w * 3 * k, x.w * 3 * k, c, 3, FxShape.Star, I, 0, (t * 3 + 0.5) % 1);
+        e.toFlight(x.x1, x.y1, 0, a); A.add(a.x, a.y, a.z, 0, x.w * 1.4, x.w * 1.4, c, 2.5, FxShape.Hot, 0.5 * I);
+      }
       // a little more bloom while the beam burns
       lanceBloom = Math.max(lanceBloom, 0.25 * left);
     } else if (o.kind === 'spear' && b) {
       const c = rgb(b.col), fl = 0.85 + 0.15 * Math.sin(t * 50), w = b.w;
-      this.streak(A, b.x1, b.y1, b.x2, b.y2, AIR + 3, w * 3.2, c, 1.8, 0.6 * fl, FxShape.Beam);
-      this.streak(A, b.x1, b.y1, b.x2, b.y2, AIR + 4, w * 1.1, c, 4.5, fl, FxShape.Beam);
-      this.streak(A, b.x1, b.y1, b.x2, b.y2, AIR + 5, w * 0.4, WHITE, 8, fl, FxShape.Beam);
+      // the bow beam and any fan spears (upgrades) share the look
+      for (const x of [b, ...(o.extra ?? [])]) {
+        this.streak(A, x.x1, x.y1, x.x2, x.y2, AIR + 3, x.w * 3.2, c, 1.8, 0.6 * fl, FxShape.Beam);
+        this.streak(A, x.x1, x.y1, x.x2, x.y2, AIR + 4, x.w * 1.1, c, 4.5, fl, FxShape.Beam);
+        this.streak(A, x.x1, x.y1, x.x2, x.y2, AIR + 5, x.w * 0.4, WHITE, 8, fl, FxShape.Beam);
+      }
       e.toFlight(b.x1, b.y1, AIR + 6, v);
       A.add(v.x, v.y, v.z, t * 5, w * 4, w * 4, c, 3, FxShape.Star, fl, 0, (t * 4) % 1);
       A.add(v.x, v.y, v.z, 0, w * 2.4, w * 2.4, WHITE, 4, FxShape.Hot, fl);

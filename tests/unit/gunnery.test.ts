@@ -2,13 +2,15 @@ import '../sim/env';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   WEAPONS, mkPart, derive, weaponControl, weaponFamily, weaponGroups, mountTraverse, inTraverse, clampTraverse, shipToField,
-  layersHit, MAGNET, TRAVERSE, neutralMods, type Build,
+  layersHit, MAGNET, TRAVERSE, neutralMods, type Build, type Mount,
 } from '../../src/data/parts';
 import { relicMods } from '../../src/data/relics';
 import {
-  S, startCombat, updateCombat, endCombat, gunnery, aim, selectGroup, cycleGroup, fireLog, type Enemy,
+  S, H, AFT, startCombat, updateCombat, endCombat, gunnery, aim, selectGroup, cycleGroup, fireLog, spawnGroup, bossGunBears, type Enemy,
 } from '../../src/game/combat';
-import { FIGHTS } from '../../src/data/enemies';
+import { FIGHTS, BOSS_ENCOUNTER } from '../../src/data/enemies';
+import { mulberry32 } from '../../src/util/rng';
+import type { Ghost } from '../../src/game/ghosts';
 
 const P = (id: string, t = 1) => mkPart(id, t);
 /** Bridge rail, a top-deck pulse + missile pair, a broadside of pulse / mortar / bomb. */
@@ -37,29 +39,38 @@ describe('weapon control split', () => {
 });
 
 describe('mount traverse arcs', () => {
-  it('bow mounts get a forward cone for air and ground, top-deck turrets all round for air only', () => {
+  it('bow mounts get a forward cone for air and ground, top-deck turrets a ring-sized arc around their facing for air only', () => {
     const bow = mountTraverse('bridge', 'W', 'pulse');
     expect(bow).toMatchObject({ arc: 'bow', layers: 'both', sectors: [{ c: 0, h: TRAVERSE.bow }] });
     const top = mountTraverse('gundeck', 'W', 'pulse');
     expect(top).toMatchObject({ arc: 'dorsal', layers: 'air' });
-    expect(top.sectors[0].h).toBeCloseTo(PI);
+    expect(top.sectors[0].h).toBeCloseTo(TRAVERSE.dorsal);
     // player ship: bow points up the screen (field angle -PI/2)
     expect(inTraverse(bow, -PI / 2)).toBe(true);
     expect(inTraverse(bow, -PI / 2 + TRAVERSE.bow - 0.01)).toBe(true);
     expect(inTraverse(bow, 0)).toBe(false);
     expect(inTraverse(bow, PI / 2)).toBe(false);
-    for (const a of [-PI / 2, 0, PI / 2, PI, 2.5]) expect(inTraverse(top, a)).toBe(true);
+    expect(inTraverse(top, -PI / 2)).toBe(true);
+    expect(inTraverse(top, 0)).toBe(false); // a standard ring (120°) does not reach abeam
+    expect(inTraverse(mountTraverse('gundeck', 'W', 'pulse', 0, 2), 0)).toBe(true); // a wide ring (180°) does
+    for (const a of [0, PI / 2, PI]) expect(inTraverse(mountTraverse('gundeck', 'W', 'pulse', 0, 3), a)).toBe(true); // full ring
+    const aft = mountTraverse('gundeck', 'W', 'pulse', 4);
+    expect(inTraverse(aft, PI / 2)).toBe(true);
+    expect(inTraverse(aft, -PI / 2)).toBe(false);
   });
-  it('broadside mounts cover their own flank; the centre mount either flank; never across the hull', () => {
-    const port = mountTraverse('battery', 'W', 'pulse', -1), stbd = mountTraverse('battery', 'W', 'pulse', 1), mid = mountTraverse('battery', 'W', 'pulse', 0);
+  it('broadside mounts cover their own flank where they face; never across the hull', () => {
+    const port = mountTraverse('battery', 'W', 'pulse', 6), stbd = mountTraverse('battery', 'W', 'pulse', 2);
     expect(port.layers).toBe('both');
     expect(inTraverse(port, PI)).toBe(true); // straight out to the left
     expect(inTraverse(port, 0)).toBe(false);
     expect(inTraverse(stbd, 0)).toBe(true);
     expect(inTraverse(stbd, PI)).toBe(false);
     expect(inTraverse(stbd, -PI / 2)).toBe(false); // dead ahead is the bow's job
-    expect(inTraverse(mid, 0) && inTraverse(mid, PI)).toBe(true);
-    expect(inTraverse(mid, -PI / 2)).toBe(false);
+    // angled forward, a sponson reaches toward the bow but is clipped at the centreline
+    const fwd = mountTraverse('battery', 'W', 'pulse', 1);
+    expect(inTraverse(fwd, -PI / 2 + 0.05)).toBe(true);
+    expect(inTraverse(fwd, -PI / 2 - 0.05)).toBe(false);
+    expect(inTraverse(fwd, PI / 2 - 0.3)).toBe(false); // nothing aft-starboard any more
   });
   it('ventral ordnance is ground only; point defense hunts shots; coils follow placement', () => {
     expect(mountTraverse('gundeck', 'W', 'bomb')).toMatchObject({ arc: 'ventral', layers: 'ground', down: true });
@@ -80,7 +91,7 @@ describe('mount traverse arcs', () => {
     expect(shipToField(0, true)).toBeCloseTo(PI / 2);
     expect(inTraverse(bow, PI / 2, true)).toBe(true);
     expect(inTraverse(bow, -PI / 2, true)).toBe(false);
-    const stbd = mountTraverse('battery', 'W', 'pulse', 1);
+    const stbd = mountTraverse('battery', 'W', 'pulse', 2);
     expect(inTraverse(stbd, 0, true)).toBe(true); // starboard stays screen-right on the mirrored ghost
   });
   it('derive() stores the traverse on every mount', () => {
@@ -227,5 +238,136 @@ describe('scrap magnet', () => {
     const b = testBuild(); b.sections[3].slots[0] = P('magnet', 2);
     expect(derive(b).magnet).toBe(MAGNET.base + 2 * MAGNET.perTier);
     expect(derive(testBuild(), relicMods(['magnetic_hull'])).magnet).toBe(MAGNET.base + 90);
+  });
+});
+
+/* ---------------- facings in combat: guns fire where their mount faces, never through the hull ---------------- */
+/** Park the ship mid-field (so targets astern are on the field) and clear what spawned. */
+const park = () => { const Pl = S.P!; Pl.x = 800; Pl.y = 330; Pl.vx = Pl.vy = 0; S.pb = []; return Pl; };
+/** Bolts in flight, as field angles. */
+const boltAngles = () => S.pb.filter((b) => b.kind === 'bolt').map((b) => Math.atan2(b.vy, b.vx));
+/** Fore battery with one starboard gun angled aft-starboard; the aft battery's sponson masks part of its arc. */
+const maskedSponson = (id: string): Build => ({ sections: [
+  { type: 'bridge', slots: [null] },
+  { type: 'battery', slots: [null, null, P(id)], face: [6, 2, 3] },
+  { type: 'battery', slots: [null, null, null] },
+] });
+/** A field bearing inside one of the mount's blocked sectors and outside its traverse. */
+function blockedBearing(m: Mount) {
+  for (const b of m.trav.blocked) for (let k = -0.9; k <= 0.9; k += 0.1) { const a = shipToField(b.c + k * b.h); if (!inTraverse(m.trav, a)) return a; }
+  return null;
+}
+
+describe('mount facings decide where guns fire', () => {
+  afterEach(() => endCombat());
+  it('a turret turned astern engages a target astern, and holds fire on one ahead', () => {
+    const aft: Build = { sections: [{ type: 'bridge', slots: [null] }, { type: 'gundeck', slots: [P('pulse'), null], face: [4, 0] }] };
+    fight(aft); const Pl = park();
+    addEnemy('heli', 'air', Pl.x + 30, Pl.y - 320); // dead ahead
+    step(1.5);
+    expect(boltAngles().length).toBe(0);
+    const tg = addEnemy('heli', 'air', Pl.x + 30, Pl.y + 320); // astern
+    step(1.5);
+    const as = boltAngles();
+    expect(as.length).toBeGreaterThan(0);
+    for (const a of as) expect(Math.sin(a)).toBeGreaterThan(0.5); // every bolt goes down the screen, astern
+    expect(tg.hp).toBeLessThan(tg.maxHp);
+  });
+  it('a sponson angled aft fires aft, and never along a bearing the hull blocks', () => {
+    fight(maskedSponson('pulse')); const Pl = park();
+    const m = Pl.dv.mounts.find((q) => q.part)!, mx = Pl.x + m.ox, my = Pl.y + m.oy, ba = blockedBearing(m);
+    expect(m.trav.blocked.length).toBeGreaterThan(0);
+    expect(ba).not.toBeNull();
+    addEnemy('heli', 'air', mx + Math.cos(ba!) * 320, my + Math.sin(ba!) * 320);
+    step(2.5);
+    expect(boltAngles().length).toBe(0);
+    // a target in its open arc, aft of the beam: the sponson fires aft, and every round stays inside its traverse
+    const oa = shipToField(m.trav.sectors[0].c);
+    addEnemy('heli', 'air', mx + Math.cos(oa) * 320, my + Math.sin(oa) * 320);
+    step(2.5);
+    const as = boltAngles();
+    expect(as.length).toBeGreaterThan(0);
+    for (const a of as) { expect(inTraverse(m.trav, a)).toBe(true); expect(Math.sin(a)).toBeGreaterThan(0); }
+  });
+  it('a blocked bearing reads BLOCKED on the reticle, not OUT OF ARC', () => {
+    gunnery.manual = true;
+    try {
+      fight(maskedSponson('rail')); const Pl = park(); selectGroup(0);
+      const m = Pl.dv.mounts.find((q) => q.part)!, mx = Pl.x + m.ox, my = Pl.y + m.oy, a = blockedBearing(m)!;
+      aim.x = mx + Math.cos(a) * 300; aim.y = my + Math.sin(a) * 300; step(0.1);
+      expect(aim.why[m.part!.uid]).toBe('blocked');
+      aim.x = mx - 400; aim.y = my; step(0.1); // across the hull to port: outside its arc altogether
+      expect(aim.why[m.part!.uid]).toBe('arc');
+    } finally { gunnery.manual = false; }
+  });
+});
+
+describe('threats from astern', () => {
+  afterEach(() => endCombat());
+  it('rear entries hold off the bottom edge (telegraphed), then come up from astern', () => {
+    fight(); const Pl = S.P!; Pl.y = 330; S.enemies = [];
+    for (const k of ['jet', 'drone', 'heli', 'gunship'] as const) spawnGroup(k, true);
+    expect(S.enemies.length).toBeGreaterThan(5);
+    for (const e of S.enemies) { expect(e.y).toBeGreaterThan(H); expect(e.warnT).toBeGreaterThan(0); }
+    const y0 = S.enemies.map((e) => e.y);
+    step(AFT.warn * 0.8);
+    expect(S.enemies.map((e) => e.y)).toEqual(y0); // still holding: the HUD shows ASTERN
+    expect(S.eb.length).toBe(0);
+    step(3);
+    for (const e of S.enemies) expect(e.y).toBeLessThan(H); // all of them came up onto the field
+    // helicopters and gunships take station off the quarter: astern of the hull's centre, out to one side
+    const quarter = S.enemies.filter((e) => e.quarter);
+    expect(quarter.length).toBeGreaterThan(0);
+    for (const e of quarter) expect(e.y).toBeGreaterThan(Pl.y);
+  });
+  it('the director sends some of every air fight up from astern', () => {
+    const real = Math.random; Math.random = mulberry32(11);
+    try {
+      startCombat({ enc: { ...FIGHTS[1], duration: 40 }, level: 3, sector: 1, build: testBuild(), hp: 999, relics: [], mods: neutralMods(), cheatDeathAvailable: false });
+      S.god = true;
+      const seen = new Set<Enemy>();
+      for (let t = 0; t < 40; t += 1 / 30) { updateCombat(1 / 30); for (const e of S.enemies) if (e.aft) seen.add(e); }
+      expect(seen.size).toBeGreaterThan(3);
+      expect([...seen].some((e) => e.type === 'jet' || e.type === 'drone')).toBe(true);
+    } finally { Math.random = real; }
+  });
+});
+
+describe('ghost guns follow their recorded facings', () => {
+  afterEach(() => endCombat());
+  /** A ghost with a bridge gun and a battery whose sponsons are angled aft: off its bow quarter nothing bears. */
+  const ghost = (): Ghost => ({ id: 't', pilot: 't', name: 'TEST', sector: 1, floor: 10, relics: [], score: 0, sections: [
+    { type: 'bridge', slots: [['pulse', 1]], face: [0] },
+    { type: 'battery', slots: [['pulse', 1], null, ['pulse', 1]], face: [5, 6, 3] },
+    { type: 'engine', slots: [null] },
+  ] });
+  function duel() {
+    startCombat({ enc: BOSS_ENCOUNTER, level: 3, sector: 1, build: testBuild(), hp: 999, relics: [], mods: neutralMods(), cheatDeathAvailable: false, ghost: ghost() });
+    const B = S.boss!; B.y = B.homeY; B.entered = true; S.god = true; S.banner = null;
+    return B;
+  }
+  /** Step with the ghost and the player held still and no escorts; returns how many shots the ghost fired. */
+  function hold(sec: number, x: number, y: number) {
+    let shots = 0; const seen = new Set<unknown>();
+    for (let t = 0; t < sec; t += 1 / 60) {
+      const Pl = S.P!, B = S.boss!; Pl.x = x; Pl.y = y; Pl.vx = Pl.vy = 0; Pl.tx = Pl.ty = null; B.x = 800; B.vx = 0; S.escortT = 1e9; S.enemies = [];
+      updateCombat(1 / 60);
+      for (const b of S.eb) if (String(b.src).startsWith('boss') && !seen.has(b)) { seen.add(b); shots++; }
+    }
+    return shots;
+  }
+  it('off its bow quarter no aimed gun bears and the ghost holds fire; under its bow the bridge gun opens up', () => {
+    const B = duel();
+    // search its bow quarters for a spot where none of its guns bear on any part of our hull
+    let spot: { x: number; y: number } | null = null;
+    for (let y = 560; y <= 800 && !spot; y += 20) for (let dx = 160; dx <= 760 && !spot; dx += 20) {
+      S.P!.x = 800 + dx; S.P!.y = y;
+      if (B.weps.every((w) => !bossGunBears(w))) spot = { x: 800 + dx, y };
+    }
+    expect(spot).not.toBeNull();
+    S.eb = [];
+    expect(hold(4, spot!.x, spot!.y)).toBe(0);
+    S.eb = [];
+    expect(hold(4, 800, 720)).toBeGreaterThan(0); // dead under its bow
   });
 });

@@ -46,8 +46,8 @@ export const HULLS: Record<HullId, HullDef> = {
     desc: 'A fast spinal-gun destroyer. No broadsides: everything points forward, with a rail spine on the bridge.',
     build: () => ({ sections: [
       { type: 'bridge', slots: [mkPart('rail', 1)] },
-      { type: 'gundeck', slots: [mkPart('pulse', 1), mkPart('pulse', 1)] },
-      { type: 'gundeck', slots: [mkPart('spread', 1), mkPart('bomb', 1)] },
+      { type: 'gundeck', slots: [mkPart('pulse', 1), mkPart('pulse', 1)], face: [1, 7] },
+      { type: 'gundeck', slots: [mkPart('spread', 1), mkPart('bomb', 1)], face: [4, 0] },
       { type: 'engine', slots: [mkPart('thruster', 1)] },
       { type: 'engine', slots: [null] },
     ] }),

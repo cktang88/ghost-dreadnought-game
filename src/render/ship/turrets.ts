@@ -164,6 +164,66 @@ const DESIGNS: Record<string, Design> = {
   },
 };
 
+/* ---------------- capital turrets ---------------- */
+/**
+ * A dreadnought gun house for the top deck and the bridge mount: one armoured turret of radius R on its
+ * barbette, sloped face, rangefinder ears across the roof, `nb` barrels run out through the face (gun-local,
+ * gs 1, yaw 0 toward the bow). The weapon changes what is mounted, not the silhouette.
+ */
+/** The sheet rects (the turret radius below is called R). */
+const R_ = R;
+function capital(p: P, g: Gun, id: string, nb: number, R: number, e: number, tier: number, tb: () => void, tr: () => void): number {
+  const P0 = p.L.paint, bk = p.rig.bk, H = R * (id === 'missile' ? 0.42 : 0.55), w = R * 0.92;
+  const poly: V2[] = [[-w * 0.6, -R * 0.95], [-w, -R * 0.42], [-w, R * 0.72], [-w * 0.72, R * 1.08], [w * 0.72, R * 1.08], [w, R * 0.72], [w, -R * 0.42], [w * 0.6, -R * 0.95]];
+  tb();
+  block(bk, poly.reverse(), 0, H, { side: B.darkPanel, top: B.panels, col: P0.hull, topCol: P0.hull.clone().multiplyScalar(1.3), bevel: R * 0.16, taper: R * 0.05, tile: 9 });
+  // Rangefinder ears across the rear roof, a cupola and hatches.
+  box(bk, B.ribs, w * 2.5, R * 0.16, R * 0.24, P0.dark, T(0, H + R * 0.06, R * 0.6));
+  for (const sx of [-1, 1]) box(bk, B.rail, R * 0.16, R * 0.2, R * 0.3, P0.plate, T(sx * w * 1.25, H + R * 0.06, R * 0.6));
+  lathe(bk, B.panels, [[0, 0], [R * 0.2, 0], [R * 0.17, R * 0.14], [0, R * 0.17]], 8, P0.plate, T(-w * 0.45, H, R * 0.1), false, 1);
+  flatRect(bk, R_.hatchRound, w * 0.2, R * 0.05, w * 0.55, R * 0.4, H + 0.02, P0.plate);
+  flatRect(bk, R_.ventSlots, -w * 0.5, R * 0.78, w * 0.5, R * 0.95, H + 0.02, P0.hull);
+  if (id === 'missile') {
+    // Trainable box launcher on the turntable: nb rows of cells.
+    tr(); const m = T(0, H + R * 0.42, -R * 0.1).multiply(RX(0.3)), bw = R * 1.35, bh = R * 0.25 * Math.max(2, nb);
+    box(bk, B.darkPanel, bw, bh, R * 1.5, P0.plate, m);
+    for (let i = 0; i < 4; i++) for (let j = 0; j < Math.max(2, nb); j++) box(bk, { m: 'black', v0: 0, v1: 1 }, bw * 0.18, R * 0.16, 0.05, P0.dark, m.clone().multiply(T(-bw * 0.36 + i * bw * 0.24, -bh / 2 + R * 0.13 + j * R * 0.25, -R * 0.76)));
+    g.muzzles.push([0, H + R * 0.42 + Math.sin(0.3) * R * 0.75, -R * 0.1 - R * 0.75]);
+    return H;
+  }
+  tr();
+  const face = -R * 0.8, yb = H * 0.5;
+  if (id === 'rail') {
+    const L = R * (tier >= 3 ? 3.1 : 2.7), m = T(0, yb, face).multiply(RX(e * 0.5)), n = Math.max(1, nb);
+    for (let i = 0; i < n; i++) {
+      const x = (i - (n - 1) / 2) * R * 0.62, mi = m.clone().multiply(T(x, 0, 0));
+      for (const bx of [-0.16, 0.16]) box(bk, B.rail, R * 0.1, R * 0.17, L, P0.dark, mi.clone().multiply(T(bx * R, 0, -L / 2)));
+      for (let k = 0; k < 6; k++) box(bk, B.ribs, R * 0.5, R * 0.3, R * 0.08, P0.hull, mi.clone().multiply(T(0, 0, -R * 0.3 - k * (L - R * 0.6) / 5)));
+      box(bk, GLOW, R * 0.09, R * 0.04, L - R * 0.3, P0.full, mi.clone().multiply(T(0, R * 0.06, -L / 2)));
+      g.muzzles.push([x, yb + Math.sin(e * 0.5) * L, face - Math.cos(e * 0.5) * L]);
+    }
+    return H;
+  }
+  if (id === 'spread') {
+    // Emitter fan: lens tubes splayed across the face.
+    const n = nb + 2;
+    for (let i = 0; i < n; i++) {
+      const a = (i - (n - 1) / 2) * 0.14, m = T((i - (n - 1) / 2) * R * 0.2, yb, face).multiply(RY(-a)).multiply(RX(e));
+      box(bk, B.rail, R * 0.12, R * 0.12, R * 1.1, P0.dark, m.clone().multiply(T(0, 0, -R * 0.55)));
+      box(bk, GLOW, R * 0.09, R * 0.09, R * 0.1, P0.full, m.clone().multiply(T(0, 0, -R * 1.12)));
+    }
+    g.muzzles.push([0, yb + Math.sin(e) * R * 1.1, face - R * 1.1]);
+    return H;
+  }
+  // Gun barrels: long rifles (pulse) or a bank of short quick-firers (flak).
+  const flak = id === 'flak', n = flak ? nb * 2 : nb, sp = Math.min(R * 0.42, (w * 1.5) / n), len = R * (flak ? 1.15 : 1.9), rad = R * (flak ? 0.045 : 0.07);
+  for (let i = 0; i < n; i++) {
+    const x = (i - (n - 1) / 2) * sp, tip = barrel(p, x, yb, face + R * 0.1, len, rad, e, true, !flak);
+    if (!flak || i % 2) g.muzzles.push(tip);
+  }
+  return H;
+}
+
 /* ---------------- static dressing (merged into the hull) ---------------- */
 interface Ctx2 { hb: Buckets; L: Livery; lights: LightSet }
 /** Stepped armoured barbette under a dorsal gun, with a painted keep-clear ring and crew lights. */
@@ -174,12 +234,35 @@ function barbette(c: Ctx2, x: number, z: number, r: number, y0: number, y1: numb
   for (let k = 0; k < 6; k++) { const a = (k / 6) * Math.PI * 2 + 0.3; c.lights.add(x + Math.cos(a) * r * 1.02, y1 - 0.15, z + Math.sin(a) * r * 1.02, c.L.light.edge, 0.9, 0.22, LMode.Steady); }
 }
 
+/**
+ * Turret ring upgrades read on the model: a wide ring (2) seats the gun in a broader armoured collar with a hazard
+ * band, a full ring (3) adds a second, stepped collar ringed with lamps.
+ */
+function ringCollar(c: Ctx2, x: number, z: number, r: number, y: number, ring: number) {
+  const P0 = c.L.paint;
+  for (let k = 1; k < ring; k++) {
+    // Each level a broader, lower step: a hazard-banded annulus that reads from above, on an armoured skirt.
+    const rr = r * (1 + 0.24 * k), yt = y - 0.35 * (k - 1) - 0.1, m = T(x, 0, z);
+    lathe(c.hb, B.ribs, [[rr, yt - 1.4], [rr, yt]], 16, P0.hull.clone().multiplyScalar(0.75), m, false, 6);
+    lathe(c.hb, B.hazard, [[rr, yt + 0.02], [rr * 0.84, yt + 0.02]], 16, P0.accent.clone().multiplyScalar(0.8), m, false, 10);
+    if (k === 2) for (let i = 0; i < 12; i++) { const a = (i / 12) * Math.PI * 2; c.lights.add(x + Math.cos(a) * rr * 1.03, yt - 0.6, z + Math.sin(a) * rr * 1.03, c.L.light.edge, 1.1, 0.26, LMode.Steady); }
+  }
+}
+
 export interface MountSpec {
   uid: number; id: string; tier: number; x: number; z: number; deck: number; trav: Traverse;
   /** Hull geometry at the mount: half width at the deck edge, the outboard gallery height, terrace edge. */
   hw: number; terrace: number; gallery: number;
+  /** Barbette height above the deck (superfiring turrets stand higher). */
+  lift?: number;
+  /** Turret ring level 1..3 (ringCollar). */
+  ring?: number;
+  /** Broadside sponson the hull built under this mount: its outboard face (|x|) and roof height. */
+  sponson?: { outer: number; top: number; z0: number; z1: number };
 }
 export interface MountOut { t: Turret; claim: [number, number, number, number] }
+/** Weapons that mount as one capital turret on the top deck, the bridge and a battery's centreline. */
+const CAPITAL = new Set(['pulse', 'spread', 'flak', 'rail', 'missile']);
 
 
 export function buildMount(s: MountSpec, rig: GunRig, hb: Buckets, L: Livery, lights: LightSet): MountOut {
@@ -226,6 +309,47 @@ export function buildMount(s: MountSpec, rig: GunRig, hb: Buckets, L: Livery, li
     return { t, claim };
   }
 
+  const centre = Math.abs(s.x) < 1;
+  if ((trav.kind === 'dorsal' || trav.kind === 'bow' || (trav.kind === 'side' && centre)) && CAPITAL.has(id)) {
+    // A capital turret on its own barbette, raised by `lift` (superfiring over the turret or casemates ahead).
+    const R = (trav.kind === 'side' ? 4.8 : id === 'rail' ? 6 : 5.6) * (1 + 0.05 * (tier - 1)), yb = s.deck + (s.lift ?? 1.6);
+    const nb = id === 'rail' ? (tier >= 4 ? 2 : 1) : id === 'flak' ? (tier >= 3 ? 3 : 2) : Math.min(4, gunCount(id, tier));
+    if (yb - s.deck > 2.5) {
+      // Superfiring: a tall armoured trunk with a ring of lit ports, the barbette crowning it.
+      block(hb, octagon(s.x - R * 1.12, s.z - R * 1.12, s.x + R * 1.12, s.z + R * 1.12, R * 0.46), s.deck, yb - 1.2, { side: B.darkPanel, top: B.ribs, col: P0.hull.clone().multiplyScalar(0.75), topCol: P0.hull, bevel: 0.3, taper: 0.15, tile: 8 });
+      lights.row([s.x - R * 0.9, yb - 2.2, s.z + R * 1.14], [s.x + R * 0.9, yb - 2.2, s.z + R * 1.14], 0.7, LL.window, 0.9, 0.22, 0.7, LMode.Steady);
+      hb.get('shadow').quad([s.x - R + 2, s.deck + 0.07, s.z - R + 1.5], [s.x + R * 1.6, s.deck + 0.07, s.z - R + 1.5], [s.x + R * 1.6, s.deck + 0.07, s.z + R * 1.8], [s.x - R + 2, s.deck + 0.07, s.z + R * 1.8], [0, 0], [1, 0], [1, 1], [0, 1], P0.hull, [0, 1, 0]);
+    }
+    barbette(c2, s.x, s.z, R * (1.02 + 0.06 * ((s.ring ?? 1) - 1)), yb - 1.2, yb);
+    ringCollar(c2, s.x, s.z, R * 1.05, yb - 1.2, s.ring ?? 1);
+    const g = rig.add(s.x, yb, s.z, 1);
+    if (g) {
+      capital(p, g, id, nb, R, trav.elev * (id === 'flak' ? 1.4 : 0.6), tier, () => rig.bk.tag([g.idx, 0]), () => rig.bk.tag([g.idx, 1]));
+      rig.bk.tag(null); t.guns.push(g);
+    }
+    t.recoil = id === 'rail' ? 2.2 : id === 'flak' ? 0.7 : 1.4;
+    if (id === 'rail') { const L = R * (tier >= 3 ? 3.1 : 2.7); t.charge = [[0, R * 0.34, -R], [0, R * 0.34 + Math.sin(trav.elev * 0.3) * L, -R * 0.8 - L]]; }
+    claim = [s.x - R * 1.25, s.z - R * 1.25 - (trav.kind === 'side' ? 0 : 1), s.x + R * 1.25, s.z + R * 1.25];
+    return { t, claim };
+  }
+
+  if (trav.kind === 'side' && s.sponson) {
+    // Casemate guns along the outboard edge of the battery sponson (the hull builds the sponson itself).
+    const sd = s.x < 0 ? -1 : 1, g2 = gs * 1.8, sp = (id === 'rail' ? 4.6 : 3.3) * g2, nn = n, x = sd * (s.sponson.outer - 1.6 * g2), y = s.sponson.top;
+    const zL = (nn - 1) * sp, za = Math.max(s.sponson.z0 + 2.5 * g2, s.z - zL / 2);
+    for (let i = 0; i < nn; i++) {
+      const gz = za + i * sp;
+      lathe(hb, B.ribs, [[1.2 * g2, 0], [1.2 * g2, 0.22], [1.0 * g2, 0.3]], 10, P0.dark, T(x, y, gz));
+      ringCollar(c2, x, gz, 1.2 * g2, y + 0.2, s.ring ?? 1);
+      const g = rig.add(x, y + 0.25, gz, g2); if (!g || !design) continue;
+      design(p, g, trav.elev, false, tier, () => rig.bk.tag([g.idx, 0]), () => rig.bk.tag([g.idx, 1]));
+      rig.bk.tag(null); t.guns.push(g);
+      lights.add(x + sd * 1.5 * g2, y - 0.6, gz, LL.window, 1, 0.25, LMode.Steady);
+    }
+    claim = [x - 2.2 * g2, za - 2 * g2, x + 2.2 * g2, za + zL + 2 * g2];
+    if (id === 'rail' && t.guns.length) { const L = tier >= 3 ? 11 : 9; t.charge = [[0, 0.75, -1.2], [0, 0.75 + Math.sin(trav.elev * 0.5) * L, -0.8 - L]]; }
+    return { t, claim };
+  }
   if (trav.kind === 'side') {
     // Flank sponson on the outboard gallery: guns in a row along the hull, resting outboard.
     const sd = s.x < 0 ? -1 : 1, sp = (id === 'rail' ? 4.5 : 3.2) * gs, nn = n, x0 = sd * (s.terrace + 0.4), x1 = sd * (s.hw + 1.6 + gs), y0 = s.gallery - 4.2, y1 = s.gallery + 0.15;
@@ -273,6 +397,7 @@ export function buildMount(s: MountSpec, rig: GunRig, hb: Buckets, L: Livery, li
     for (const [px, pz, up] of pos) {
       const yb = s.deck + 0.35 + (0.45 + up * 0.9) * gs;
       barbette(c2, px, pz, r, s.deck + 0.35, yb);
+      ringCollar(c2, px, pz, r, yb, s.ring ?? 1);
       place(px, yb, pz, false);
     }
     if (id === 'missile') {

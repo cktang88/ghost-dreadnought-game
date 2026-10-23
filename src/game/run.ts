@@ -1,5 +1,5 @@
 // Run state: everything that persists between nodes, plus save/load.
-import { derive, starterBuild, mkPart, allParts, buildToGhost, ghostToBuild, isPart, partSlot, type Build, type Part, WEAPONS, UTILS, SECTIONS, type SectionType, MAX_SECTIONS, sectionCost } from '../data/parts';
+import { derive, starterBuild, mkPart, allParts, buildToGhost, ghostToBuild, isPart, partSlot, type Build, type Part, WEAPONS, UTILS, SECTIONS, type SectionType, MAX_SECTIONS, sectionCost, attachSpots, pinLayout } from '../data/parts';
 import { RELICS, relicMods, type Rarity } from '../data/relics';
 import { generateMap, type SectorMap } from './map';
 import { mulberry32, pick, rint, clamp, has, type Rng } from '../util/rng';
@@ -7,6 +7,7 @@ import type { Ghost } from './ghosts';
 import { HULLS, isHullId, type HullId } from '../data/hulls';
 import { heatFx, MAX_HEAT } from '../data/heat';
 import { noPerks, type RankPerks } from '../data/goals';
+import { OD_NODE, canTakeOd, sanitizeOd } from '../data/overdriveTree';
 
 /** Per-run counters, shown in the wreck report and folded into the profile when the run ends. */
 export interface RunStats {
@@ -24,7 +25,7 @@ export interface RunSeen { enemies: Record<string, number>; ghosts: { id: string
 export const CAMPAIGN_SECTORS = 3;
 
 export interface RunState {
-  v: 3; seed: number; pilot: string; callsign: string; sector: number; map: SectorMap; at: string | null; visited: string[];
+  v: 4; seed: number; pilot: string; callsign: string; sector: number; map: SectorMap; at: string | null; visited: string[];
   build: Build; inv: Part[]; scrap: number; hp: number; relics: string[]; jumpUsed: boolean;
   stats: RunStats;
   rngCalls: number; bossGhost: Ghost | null; bossGhostCount: number;
@@ -37,6 +38,10 @@ export interface RunState {
   /** Overdrive charge each fight starts with (rank perk). */
   odStart: number;
   seen: RunSeen;
+  /** Overdrive upgrade picks, in the order taken (node ids, data/overdriveTree.ts). */
+  od: string[];
+  /** Free Overdrive commissions banked (one per sector boss): a pick that costs no scrap. */
+  odCredits: number;
 }
 export interface RunOptions { hull?: HullId; heat?: number; daily?: string | null; perks?: RankPerks }
 
@@ -51,11 +56,11 @@ export function getPilotId(): string {
 export function newRun(callsign: string, seed = (Math.random() * 2 ** 31) | 0, opts: RunOptions = {}): RunState {
   const hull = HULLS[opts.hull ?? 'vanguard'], perks = opts.perks ?? noPerks(), heat = Math.max(0, Math.min(MAX_HEAT, opts.heat ?? 0));
   const run: RunState = {
-    v: 3, seed, pilot: getPilotId(), callsign, sector: 1, map: generateMap(1, seed), at: null, visited: [],
+    v: 4, seed, pilot: getPilotId(), callsign, sector: 1, map: generateMap(1, seed), at: null, visited: [],
     build: hull.build(), inv: hull.hold(), scrap: hull.scrap + perks.startScrap, hp: 0, relics: [], jumpUsed: false,
     stats: emptyRunStats(), rngCalls: 0, bossGhost: null, bossGhostCount: 0,
     hull: hull.id, heat, daily: opts.daily ?? null, won: false, endless: false, phase: 'map', odStart: perks.odStart,
-    seen: { enemies: {}, ghosts: [] },
+    seen: { enemies: {}, ghosts: [] }, od: [], odCredits: 0,
   };
   const rng = runRng(run);
   for (let i = 0; i < perks.extraPart; i++) run.inv.push(mkPart(pick([...Object.keys(WEAPONS), ...Object.keys(UTILS)], rng), 1));
@@ -125,13 +130,34 @@ export function relicChoices(run: RunState, n: number, rarities: Rarity[]): stri
   return out;
 }
 export function addRelic(run: RunState, id: string) { changeBuild(run, () => { if (!run.relics.includes(id)) run.relics.push(id); }); }
+/**
+ * Weld a new module on: astern on the keel line, or on a placed (grid) ship at the aftmost spot where it joins the hull,
+ * nearest the keel. The refit board then moves it to the spot the player dropped it on (placeModule).
+ */
 export function addSection(run: RunState, type: SectionType) {
   if (run.build.sections.length >= MAX_SECTIONS) return false;
-  changeBuild(run, () => run.build.sections.push({ type, slots: SECTIONS[type].slots.map(() => null) }));
+  const b = run.build, spot = b.sections.some((s) => s.at) ? attachSpots(b, type).sort((p, q) => q[1] - p[1] || Math.abs(p[0]) - Math.abs(q[0]))[0] : undefined;
+  changeBuild(run, () => {
+    if (spot) pinLayout(b);
+    b.sections.push({ type, slots: SECTIONS[type].slots.map(() => null), ...(spot ? { at: spot } : {}) });
+  });
   return true;
 }
 export const nextSectionCost = (run: RunState, t: SectionType) => Math.round(sectionCost(t, run.build.sections.length) * mods(run).priceMul);
 
+/**
+ * Overdrive refits. A pick costs a banked commission (sector bosses award one) or the node's scrap price times
+ * `priceMul` (drydock 1, merchant its price multiplier). Returns what it cost, or null if it could not be taken.
+ */
+export function odPrice(run: RunState, id: string, priceMul = 1) { return run.odCredits > 0 ? 0 : Math.round(OD_NODE[id].cost * priceMul); }
+export function takeOd(run: RunState, id: string, priceMul = 1): { cost: number; credit: boolean } | null {
+  if (!canTakeOd(id, run.od) || OD_NODE[id].kind !== HULLS[run.hull].overdrive) return null;
+  const credit = run.odCredits > 0, cost = odPrice(run, id, priceMul);
+  if (!credit && run.scrap < cost) return null;
+  if (credit) run.odCredits--; else run.scrap -= cost;
+  run.od.push(id);
+  return { cost, credit };
+}
 export function enterNextSector(run: RunState) {
   run.sector++; run.map = generateMap(run.sector, run.seed); run.at = null; run.visited = []; run.bossGhost = null; run.bossGhostCount = 0;
 }
@@ -140,20 +166,22 @@ export function deathGhost(run: RunState): Ghost {
 }
 
 /* ---- save / load ---- */
-export const SAVE_KEY = 'gd.run.v3';
-const LEGACY_KEYS = ['gd.run.v2'];
+export const SAVE_KEY = 'gd.run.v4';
+const LEGACY_KEYS = ['gd.run.v3', 'gd.run.v2'];
 export function saveRun(run: RunState) {
   try { localStorage.setItem(SAVE_KEY, JSON.stringify({ ...run, build: buildToGhost(run.build), inv: run.inv.map((p) => [p.id, p.tier]) })); } catch { /* storage full or blocked */ }
 }
 export function clearSave() { try { localStorage.removeItem(SAVE_KEY); for (const k of LEGACY_KEYS) localStorage.removeItem(k); } catch { /* ignore */ } }
 /**
  * Run-save migrations, one step per version: v2 (before hull classes and the meta loop) -> v3 adds the hull
- * (Vanguard), heat 0, no daily, the new stats counters and the codex tally.
+ * (Vanguard), heat 0, no daily, the new stats counters and the codex tally; v3 -> v4 adds the Overdrive tree (no
+ * picks; a run already past a sector boss gets one banked commission per boss beaten).
  */
 export function migrateRunSave(o: any): any | null {
   if (!o || typeof o !== 'object' || !o.map?.nodes) return null;
   if (o.v === 2) o = { ...o, v: 3, hull: 'vanguard', heat: 0, daily: null, won: false, endless: false, phase: 'map', odStart: 0, seen: { enemies: {}, ghosts: [] }, stats: { ...emptyRunStats(), ...(o.stats || {}) } };
-  if (o.v !== 3) return null;
+  if (o.v === 3) o = { ...o, v: 4, od: [], odCredits: Math.max(0, Math.floor(Number(o.stats?.bosses) || 0)) };
+  if (o.v !== 4) return null;
   return o;
 }
 export function loadRun(): RunState | null {
@@ -169,6 +197,8 @@ export function loadRun(): RunState | null {
     run.stats = { ...emptyRunStats(), ...(run.stats || {}) };
     run.seen = { enemies: { ...(run.seen?.enemies || {}) }, ghosts: Array.isArray(run.seen?.ghosts) ? run.seen.ghosts : [] };
     run.phase = run.phase === 'victory' ? 'victory' : 'map';
+    run.od = sanitizeOd(run.od).filter((id) => OD_NODE[id].kind === HULLS[run.hull].overdrive);
+    run.odCredits = clamp(Math.floor(Number(run.odCredits) || 0), 0, 9);
     run.hp = clamp(Number(run.hp) || 1, 1, maxHp(run));
     return run;
   } catch { return null; }

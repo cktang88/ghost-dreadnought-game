@@ -61,6 +61,7 @@ export function mapLegend() {
 export interface MapScreenOpts {
   run: RunState; chart: SVGSVGElement; toast: string; readout: HTMLElement; intel: HTMLElement;
   onRefit: () => void; onMenu: () => void;
+  /** Open the Overdrive refit tree (a banked commission can be spent from the map). */ onTree?: () => void;
 }
 export function mapScreenView(o: MapScreenOpts) {
   const r = o.run;
@@ -70,6 +71,7 @@ export function mapScreenView(o: MapScreenOpts) {
   return el('div', { class: 'page map-page', 'data-screen': 'map' },
     topBar(r,
       el('button', { class: 'btn', id: 'btn-refit', onclick: o.onRefit }, icon('auto-repair'), 'Refit ship'),
+      o.onTree ? el('button', { class: 'btn' + (r.odCredits > 0 ? ' od-due' : ''), id: 'btn-od-tree', onclick: o.onTree }, icon('power-lightning'), 'Overdrive', r.odCredits > 0 ? el('b', 'od-badge', String(r.odCredits)) : null) : null,
       el('button', { class: 'btn ghost', onclick: o.onMenu }, 'Menu')),
     el('div', 'chartroom',
       el('div', 'table',

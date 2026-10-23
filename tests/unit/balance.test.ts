@@ -38,14 +38,17 @@ describe('balance harness (headless combat)', () => {
     }
   }, 30_000);
   it('a mouse gunner firing the heavy groups by hand does at least as well as the self-aiming batteries', () => {
+    // Mean over four seeds: with threats from every bearing one fight's DPS swings by a quarter either way.
+    const seeds = [1, 2, 3, 4], mean = (a: number[]) => a.reduce((s, v) => s + v, 0) / a.length;
     for (const [enc, level, sector, build] of [[FIGHTS[0], 1, 1, 'starter'], [BOSS_ENCOUNTER, 6.6, 2, 'mid'], [FIGHTS[2], 7.7, 3, 'late']] as const) {
-      const auto = runFight({ enc, level, sector, build });
-      const hand = runFight({ enc, level, sector, build, bot: 'gunner' });
-      expect(hand.outcome, `${build} ${enc.id}`).toBe('win');
-      expect(hand.dps, `${build} ${enc.id}`).toBeGreaterThan(auto.dps * 0.85);
-      expect(hand.dps, `${build} ${enc.id}`).toBeLessThan(auto.dps * 1.6);
+      const auto = seeds.map((seed) => runFight({ enc, level, sector, build, seed }));
+      const hand = seeds.map((seed) => runFight({ enc, level, sector, build, seed, bot: 'gunner' }));
+      for (const h of hand) expect(h.outcome, `${build} ${enc.id}`).toBe('win');
+      const a = mean(auto.map((r) => r.dps)), h = mean(hand.map((r) => r.dps));
+      expect(h, `${build} ${enc.id}`).toBeGreaterThan(a * 0.85);
+      expect(h, `${build} ${enc.id}`).toBeLessThan(a * 1.6);
     }
-  }, 60_000);
+  }, 120_000);
   it.runIf(REPORT)('prints the full table', async () => {
     const only = (process.env.ONLY || '').split(',').filter(Boolean);
     for (const bot of ['pilot', 'gunner', 'idle'] as const) {

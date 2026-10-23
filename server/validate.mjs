@@ -23,7 +23,13 @@ export function validateGhost(g) {
       if (!ok) return null;
       return [id, Math.min(5, Math.max(1, Math.round(Number(v[1]) || 1)))];
     });
-    sections.push({ type: s.type, slots });
+    // Mount facings (0..7, clockwise from the bow); the client checks which are allowed where (allowedFacings).
+    const face = kinds.map((_, i) => { const f = Array.isArray(s.face) ? Number(s.face[i]) : 0; return Number.isInteger(f) && f >= 0 && f < 8 ? f : 0; });
+    const ring = kinds.map((_, i) => { const r = Array.isArray(s.ring) ? Math.round(Number(s.ring[i])) : 1; return r >= 1 && r <= 3 ? r : 1; });
+    const sec = { type: s.type, slots, face, ring };
+    // Grid position (design units); the client checks the layout is one joined hull.
+    if (Array.isArray(s.at) && s.at.length === 2 && s.at.every((v) => Number.isFinite(Number(v)) && Math.abs(Number(v)) < 400)) sec.at = [Number(s.at[0]), Number(s.at[1])];
+    sections.push(sec);
   }
   if (!sections.some((s) => s.type === 'bridge')) return null;
   const name = String(g.name || '').toUpperCase().replace(/[^A-Z0-9 _.\-]/g, '').trim().slice(0, 16) || 'UNKNOWN';

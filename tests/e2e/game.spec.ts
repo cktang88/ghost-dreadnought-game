@@ -138,10 +138,10 @@ test('refit board: drag to equip, swap mounts, unmount, reorder sections, keyboa
   await page.focus('[data-slot="2-0"]'); await page.keyboard.press('Enter');
   expect(await gd<string>(page, 'g.run.build.sections[2].slots[0].id')).toBe('plate');
 
-  // Sections: drag the engine block forward of the battery.
-  await drag(page, 'li.sec[data-sec="2"] .sec-nm', 'li.sec[data-sec="1"]');
-  expect(await gd<string>(page, "g.run.build.sections.map(s => s.type).join(',')")).toBe('bridge,engine,battery');
-  expect(await page.evaluate(() => localStorage.getItem('gd.run.v3') ?? '')).toContain('"engine"');
+  // Modules: nudge the engine block to starboard; it joins the hull at the next legal grid spot.
+  await page.click('li.sec[data-sec="2"] button[aria-label="Move Engine Block to starboard"]');
+  expect(await gd<number>(page, 'g.run.build.sections[2].at[0]')).toBeGreaterThan(0);
+  expect(await page.evaluate(() => localStorage.getItem('gd.run.v4') ?? '')).toContain('"at"');
   await page.screenshot({ path: `${SHOTS}/17-refit-after.png` });
   await page.click('#btn-done');
   await expect(page.locator('svg[aria-label^="Sector"]')).toBeVisible();
@@ -234,6 +234,8 @@ test('boss fight leads to salvage, relic and the next sector', async ({ page }) 
   await page.locator('.pcard').first().click();
   await expect(page.getByRole('heading', { name: 'Choose a relic' })).toBeVisible();
   await page.locator('.pcard').first().click();
+  // The boss's commission opens the Overdrive tree; bank it for later.
+  await page.getByRole('button', { name: 'Bank it and continue' }).click();
   await expect(page.locator('svg[aria-label="Sector 2 route map"]')).toBeVisible();
   expect(await gd<number>(page, 'g.run.stats.bosses')).toBe(1);
 });
@@ -338,6 +340,8 @@ test('victory after sector 3 banks the run, unlocks heat and offers endless', as
   await expect(page.getByRole('heading', { name: /^Salvage:/ })).toBeVisible({ timeout: 120_000 });
   await page.locator('.pcard').first().click();
   await page.locator('.pcard').first().click();
+  const bank = page.getByRole('button', { name: 'Bank it and continue' });
+  if (await bank.isVisible({ timeout: 3000 }).catch(() => false)) await bank.click();
   await expect(page.getByRole('heading', { name: 'Victory' })).toBeVisible();
   await page.screenshot({ path: `${SHOTS}/18-victory.png`, fullPage: true });
   // the choice survives a reload

@@ -1,17 +1,21 @@
 import { describe, it, expect } from 'vitest';
-import { derive, mkPart, SECTIONS, type Build, type SectionType } from '../../src/data/parts';
+import { derive, mkPart, layoutIssue, layoutOf, SECTIONS, type Build, type SectionType } from '../../src/data/parts';
 import { HULLS, HULL_IDS } from '../../src/data/hulls';
-import { mountDrawPos } from '../../src/render/shipPreview';
+import { planExtent } from '../../src/render/shipPreview';
 import {
   layoutBoard, resolve1D, segmentsCross, countCrossings, segmentHitsRect, STACK_BELOW,
   checkMove, applyMove, previewMove, moveSection, canMoveSection, cutSection, firepower, statDeltas, type Anchor,
+  coverage, quarters, weakestQuarter, rotateMount, rotateWhy, arcView, intersectSectors, mountDps, ROSE_BINS,
+  anchorsFor, placeSpots, dropSpot, placeIssue, previewPlacing, nudgeSpot, planOffset, spotAt, spotBox, mountCard, shipCard, previewRing, upgradeRing, placeModule,
 } from '../../src/ui/refitLogic';
 
 // Anchors exactly as the board computes them: where each mount is drawn on the plan.
-const anchorsOf = (b: Build): Anchor[] => {
-  const d = derive(b);
-  return d.mounts.map((m) => { const [ox, oy] = mountDrawPos(d, m); return { id: `${m.si}-${m.i}`, ox, oy, si: m.si, i: m.i, bow: b.sections[m.si].type === 'bridge' }; });
-};
+const anchorsOf = (b: Build): Anchor[] => anchorsFor(derive(b));
+/** A build on the grid: [type, x, y] per module (design units). */
+const grid = (...ms: [SectionType, number, number][]): Build => ({ sections: ms.map(([t, x, y]) => ({ type: t, slots: SECTIONS[t].slots.map(() => null), at: [x, y] as [number, number] })) });
+const HAMMERHEAD = grid(['gundeck', -26, 0], ['battery', 0, 0], ['gundeck', 26, 0], ['bridge', 0, 24], ['engine', 0, 54]);
+const OUTRIGGER = grid(['bridge', 0, 0], ['gundeck', 0, 30], ['battery', -26, 32], ['battery', 26, 32], ['engine', 0, 56]);
+const WIDE = grid(['bridge', 0, 0], ['gundeck', 0, 30], ['battery', -26, 30], ['battery', 26, 30], ['spine', 0, 56], ['battery', 0, 74], ['engine', -26, 74], ['engine', 26, 74]);
 const armed = (b: Build): Build => ({ sections: b.sections.map((s) => ({ type: s.type, slots: SECTIONS[s.type].slots.map((k, i) => mkPart(k === 'W' ? (i === 1 ? 'bomb' : 'pulse') : 'plate', 1)) })) });
 const build = (...types: SectionType[]): Build => ({ sections: types.map((t) => ({ type: t, slots: SECTIONS[t].slots.map(() => null) })) });
 const BUILDS: [string, Build][] = [
@@ -21,6 +25,9 @@ const BUILDS: [string, Build][] = [
   ['mixed eight armed', armed(build('bridge', 'gundeck', 'battery', 'spine', 'armor', 'battery', 'gundeck', 'engine'))],
   ['mixed eight', build('bridge', 'gundeck', 'battery', 'spine', 'armor', 'battery', 'gundeck', 'engine')],
   ['bridge only', build('bridge')],
+  ['bridge amidships armed', armed(build('gundeck', 'battery', 'gundeck', 'bridge', 'battery', 'gundeck', 'engine', 'engine'))],
+  ['bridge astern', armed(build('battery', 'gundeck', 'battery', 'gundeck', 'bridge'))],
+  ['hammerhead', HAMMERHEAD], ['hammerhead armed', armed(HAMMERHEAD)], ['outrigger armed', armed(OUTRIGGER)], ['wide eight armed', armed(WIDE)],
   ['long spine', build('bridge', 'spine', 'spine', 'spine', 'engine', 'engine', 'engine', 'engine')],
 ];
 const SIZES: [number, number][] = [[940, 760], [700, 640], [1200, 820], [660, 560]];
@@ -39,10 +46,16 @@ describe('refit board layout', () => {
     expect(segmentHitsRect([0, 5], [20, 5], { x: 8, y: 0, w: 8, h: 10 })).toBe(true);
     expect(segmentHitsRect([0, 20], [20, 20], { x: 8, y: 0, w: 4, h: 10 })).toBe(false);
   });
+  it('the grid test builds are real ships', () => { for (const b of [HAMMERHEAD, OUTRIGGER, WIDE]) expect(layoutIssue(b)).toBe(null); });
   for (const [name, b] of BUILDS) for (const [w, h] of SIZES) it(`${name} at ${w}x${h}: tiles fit, never overlap, leaders never cross`, () => {
     const d = derive(b), anchors = anchorsOf(b);
-    const L = layoutBoard({ w, h, len: d.len, width: d.width, anchors });
+    const L = layoutBoard({ w, h, len: d.len, width: d.width, anchors, ...planExtent(d) });
     expect(L.mode).toBe('callout');
+    // The whole plan, pointed bow and stern included, fits between the top tiles and the bottom edge.
+    const ext = planExtent(d), top = L.ship.cy + (-d.len / 2 - ext.lead) * L.ship.s, bot = L.ship.cy + (d.len / 2 + ext.tail) * L.ship.s;
+    expect(bot).toBeLessThanOrEqual(h + 0.5);
+    const tops = L.tiles.filter((t) => t.side === 'top');
+    if (tops.length) expect(top).toBeGreaterThan(Math.max(...tops.map((t) => t.y + t.h)));
     expect(L.tiles.length).toBe(anchors.length);
     for (const t of L.tiles) {
       expect(t.x).toBeGreaterThanOrEqual(-0.5); expect(t.y).toBeGreaterThanOrEqual(-0.5);
@@ -126,14 +139,121 @@ describe('refit moves', () => {
     const f2 = firepower(derive(b));
     expect(f2.ground).toBeGreaterThan(0); expect(f2.air).toBeCloseTo(f1.air * 2);
   });
-  it('sections reorder behind the bridge and cut loose into the hold', () => {
+  it('sections reorder anywhere, the bridge too, and cut loose into the hold', () => {
     const b = HULLS.lance.build(), inv: ReturnType<typeof mkPart>[] = [];
-    expect(canMoveSection(b, 0, 2)).toBe(false);
-    expect(canMoveSection(b, 3, 0)).toBe(false);
+    expect(canMoveSection(b, 2, 2)).toBe(false);
+    expect(canMoveSection(b, 9, 0)).toBe(false);
     expect(moveSection(b, 4, 1)).toBe(true);
     expect(b.sections.map((s) => s.type)).toEqual(['bridge', 'engine', 'gundeck', 'gundeck', 'engine']);
+    expect(moveSection(b, 0, 2)).toBe(true);
+    expect(b.sections.map((s) => s.type)).toEqual(['engine', 'gundeck', 'bridge', 'gundeck', 'engine']);
+    expect(moveSection(b, 2, 0)).toBe(true);
     expect(cutSection(b, inv, 0)).toBe(null);
     expect(cutSection(b, inv, 2)!.type).toBe('gundeck');
     expect(inv.map((p) => p.id)).toEqual(['pulse', 'pulse']);
+  });
+});
+
+describe('facing and coverage', () => {
+  const starter = () => HULLS.vanguard.build();
+  it('rotating a sponson aft swings its fire astern; the rose sees it', () => {
+    const b = starter(), aft = (bb: Build) => quarters(coverage(derive(bb))).find((q) => q.key === 'aft')!.air;
+    const before = aft(b), si = b.sections.findIndex((s) => s.type === 'battery');
+    expect(rotateWhy(b, si, 2)).toBe(null);
+    expect(rotateMount(b, si, 2, 1)).toBe(true); // starboard abeam -> aft-starboard
+    expect(derive(b).mounts.find((m) => m.si === si && m.i === 2)!.facing).toBe(3);
+    expect(aft(b)).toBeGreaterThan(before);
+  });
+  it('coverage sums each mount on the bearings its masked arc covers, and matches firepower', () => {
+    const b = build('bridge', 'gundeck'); b.sections[1].slots[0] = mkPart('pulse', 1);
+    const d = derive(b), cov = coverage(d), dps = mountDps(d, d.mounts[1]).air;
+    expect(cov.air.length).toBe(ROSE_BINS);
+    expect(Math.max(...cov.air)).toBeCloseTo(dps);
+    expect(cov.air[0]).toBe(0); // dead ahead: the bridge tower masks the turret behind it
+    expect(Math.max(...cov.ground)).toBe(0);
+    expect(firepower(d).air).toBeCloseTo(dps);
+  });
+  it('calls out the weakest quarter: a bow gun alone leaves it blind astern', () => {
+    const b = build('bridge', 'engine'); b.sections[0].slots[0] = mkPart('pulse', 1);
+    const g = weakestQuarter(coverage(derive(b)));
+    expect(g.severity).toBe('blind'); expect(g.label).toBe('BLIND ASTERN');
+    const s = starter(), gs = weakestQuarter(coverage(derive(s)));
+    expect(gs.label).toBe('NO AA ASTERN'); // the bomb bay reaches all round, the guns do not
+  });
+  it('bays, bombs and all-round weapons cannot be rotated', () => {
+    const b = starter(), si = b.sections.findIndex((s) => s.type === 'battery');
+    expect(rotateWhy(b, si, 1)).toMatch(/belly/);
+    expect(rotateWhy(b, b.sections.findIndex((s) => s.type === 'engine'), 0)).toMatch(/Utility/);
+    b.sections[si].slots[1] = mkPart('pd', 1);
+    expect(rotateWhy(b, si, 1)).toMatch(/All-round/);
+    b.sections[si].slots[1] = null;
+    expect(rotateWhy(b, si, 1)).toBe(null); // an empty weapon mount can be pre-aimed
+  });
+  it('arc views clip what blocks a gun to its own arc', () => {
+    const b = build('bridge', 'gundeck'); b.sections[1].slots[0] = mkPart('pulse', 1);
+    const av = arcView(derive(b), 1, 0)!;
+    expect(av.blocked.length).toBe(1); expect(av.blocked[0].by).toBe('bridge');
+    expect(Math.abs(av.blocked[0].c)).toBeLessThan(0.05);
+    expect(intersectSectors([{ c: 3, h: 0.3 }], [{ c: -3, h: 0.3 }]).length).toBe(1); // across the stern seam
+  });
+});
+
+describe('module grid on the board', () => {
+  it('legal spots all keep the hull joined, and the drop snaps to the nearest one', () => {
+    const b = HULLS.vanguard.build(), eng = b.sections.findIndex((s) => s.type === 'engine');
+    const spots = placeSpots(b, { si: eng, type: 'engine' });
+    expect(spots.length).toBeGreaterThan(3);
+    for (const at of spots) expect(placeIssue(b, { si: eng, type: 'engine' }, at)).toBe(null);
+    const target = spots.find((a) => a[0] !== 0)!; // beside the hull
+    const d = dropSpot(b, { si: eng, type: 'engine' }, [target[0] + 1, target[1]], spots);
+    expect(d).toMatchObject({ ok: true, snapped: true, at: target });
+    const far = dropSpot(b, { si: eng, type: 'engine' }, [200, 200], spots);
+    expect(far.ok).toBe(false); expect(far.why).toMatch(/join/);
+    const nb = previewPlacing(b, { si: eng, type: 'engine' }, target)!;
+    expect(layoutOf(nb)[eng]).toEqual(target); expect(b.sections[eng].at).toBeUndefined(); // the real build is untouched
+  });
+  it('a new module from the counter previews at a spot and is refused when the hull is full', () => {
+    const b = HULLS.vanguard.build(), p = { si: -1, type: 'gundeck' as SectionType }, spots = placeSpots(b, p);
+    const nb = previewPlacing(b, p, spots[0])!;
+    expect(nb.sections.length).toBe(b.sections.length + 1); expect(layoutIssue(nb)).toBe(null);
+    const full = build('bridge', 'spine', 'spine', 'spine', 'engine', 'engine', 'engine', 'engine');
+    expect(placeIssue(full, p, [0, 200])).toMatch(/eight/);
+  });
+  it('pointer to grid: a spot under the pointer maps back onto the same board box', () => {
+    const b = HAMMERHEAD, d = derive(b), off = planOffset(b, d);
+    d.rects.forEach((r, si) => {
+      const t = b.sections[si].type, at = spotAt(t, r.x + r.w / 2, r.y + r.h / 2, off);
+      expect(at).toEqual(layoutOf(b)[si]);
+      const bx = spotBox(t, at, off); expect(bx.x).toBeCloseTo(r.x); expect(bx.y).toBeCloseTo(r.y);
+    });
+  });
+  it('keyboard nudge steps to the next legal spot and keeps the ship joined', () => {
+    const b = HULLS.vanguard.build(), eng = b.sections.findIndex((s) => s.type === 'engine');
+    const at = nudgeSpot(b, eng, 1, 0)!;
+    expect(at).not.toBe(null);
+    expect(placeModule(b, eng, at)).toBe(true);
+    expect(layoutIssue(b)).toBe(null);
+    expect(nudgeSpot(b, 0, 0, -1, 3)).toBe(null); // nothing joins three steps ahead of the bow
+  });
+  it('the bridge gun is called out on top only when it is the foremost mount', () => {
+    expect(anchorsFor(derive(HULLS.vanguard.build())).filter((a) => a.bow).length).toBe(1);
+    expect(anchorsFor(derive(armed(HAMMERHEAD))).some((a) => a.bow)).toBe(false);
+  });
+});
+
+describe('compare cards and turret rings', () => {
+  it('a ring refit widens the clear arc on the card and costs nothing until bought', () => {
+    const b = build('bridge', 'gundeck', 'engine'); b.sections[1].slots[0] = mkPart('pulse', 1);
+    const a = mountCard(derive(b), 1, 0)!, nb = previewRing(b, 1, 0)!, c = mountCard(derive(nb), 1, 0)!;
+    expect(c.ring).toBe(2); expect(c.arc!).toBeGreaterThan(a.arc!);
+    expect(b.sections[1].ring).toBeUndefined();
+    upgradeRing(nb, 1, 0);
+    const full = mountCard(derive(nb), 1, 0)!;
+    expect(full.ring).toBe(3); expect(full.arc!).toBeGreaterThan(c.arc!); expect(full.arc!).toBeLessThan(360); // full ring: only the tower masks it
+  });
+  it('mount and ship cards carry the numbers the compare card shows', () => {
+    const d = derive(HULLS.vanguard.build()), m = mountCard(d, 0, 0)!, sc = shipCard(d);
+    expect(m.name).toBe('Pulse Cannon'); expect(m.range).toBeGreaterThan(0); expect(m.cd).toBeGreaterThan(0); expect(m.air + m.ground).toBeGreaterThan(0);
+    expect(sc.hull).toBe(d.maxHp); expect(sc.air).toBeGreaterThan(0); expect(sc.gap.label).toMatch(/ASTERN|AHEAD|PORT|STARBOARD/);
   });
 });

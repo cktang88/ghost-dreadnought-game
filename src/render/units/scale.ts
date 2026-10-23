@@ -27,6 +27,10 @@ export const TRUE_M: Record<EnemyType, number> = {
   crawler: 180,   // siege crawler: a land battleship
 };
 
+/** Air units' drop shadows land this far (field units) down-right of them: the moon is up-left. The symbology's
+ *  drop line ends on the same spot. Shadows fade out by SHADOW_ALT of visual altitude. */
+export const SHADOW_DX = 34, SHADOW_DY = 44, SHADOW_ALT = 900;
+
 /** Published by the unit layer: ground scale k (field units per ground metre is 1 / k), and the camera's field
  *  position and height over the flight plane (to place a marker on an aircraft that is climbing or descending). */
 export const SCALE_STATE = { k: 1.65, camFx: 800, camFy: 1092, camH: 1838 };

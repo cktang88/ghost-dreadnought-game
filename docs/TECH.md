@@ -13,7 +13,7 @@
 - Flight-plane objects use `engine.toFlight(x, y, alt)`. Ground objects use `engine.toGround(x, y)` and must be scaled by `engine.groundScale`.
 - Ship hulls are `SECTIONS` design units × `SHIP_SCALE` (3.1; it was 2.6 before the scale pass). `derive()` already returns scaled rects and mounts.
 - The city is authored in its own design units and shrunk by `CITY_K` (0.25) into field units (`src/game/worldgen.ts`, see "City").
-- **True scale: one world unit is one metre.** A finished hull is 330-370 field units (a 330 m carrier); aircraft fly on the flight plane,
+- **True scale: one world unit is one metre.** A finished hull is 330-550 field units long and under 100 wide; aircraft fly on the flight plane,
   so a 19 m interceptor is 19 field units; a ground object of m metres covers m / groundScale (~1.65) field units, so a 10 m tank is ~6.
   Enemy models are drawn at `TRUE_M[type]` metres (`src/render/units/scale.ts`; `UnitSpec.scale` is computed from each model's extent).
   Gameplay radii (`EN[type].r`) are unchanged and decoupled from the drawing: they were already generous, and now act as the marker radius.
@@ -78,31 +78,69 @@ Renderers read it every frame; nothing here needs to be written by them.
 - `tx, ty` pointer-steer target (null when keys steer). Movement math: `src/game/feel.ts` (`stepShipVelocity`, `arriveWish`, `stepBank`).
 - Bounds: the whole 1600×900 field minus the hull's half size (56 units kept clear at the top for the HUD).
 
-### Firing arcs, traverse and target layers (`src/data/parts.ts`)
-Where a gun is mounted decides where it can point and what it can hit:
+### Firing arcs, facing, hull shadows and target layers (`src/data/parts.ts`)
+Where a gun is mounted, which way it faces and what stands around it decide where it can point and what it can hit.
 
-| Arc | Mounts | Traverse (ship space, 0 = bow) | Engages |
-| --- | --- | --- | --- |
-| `bow` | Command Bridge | forward cone ±`TRAVERSE.bow` (0.75 rad) | air and ground |
-| `dorsal` | Gun Deck turrets (top deck) | all round | air only (aircraft and ghost dreadnoughts): they cannot depress below the hull |
-| `broadside` | Broadside Battery | its flank ±`TRAVERSE.broadside` (1.0 rad) about the beam; the centre mount either flank | air and ground |
-| `ventral` | any bomb bay or mortar | falls (`down: true`) | ground only; a flying ghost is out of reach |
-| `omni` | point defense, arc coils | all round | PD: enemy fire (`shots`); coils: air from the top deck, air and ground elsewhere |
+**Hull shape.** Sections are long and narrow (`SECTIONS[t].w` is the beam, `h` the length along the keel; the hull proper is
+`HULL_BEAM` wide, a battery's sponsons stand out of it). A starter is ~229 × 93 field units, an eight-section ship ~550 long, so
+section order really moves guns along the keel. `slotPos(type, i)` places mounts: the bridge gun ahead of the tower, Gun Deck turrets
+on the centreline fore and aft, battery sponsons port and starboard with a centreline casemate between. Any section, the bridge too,
+may sit anywhere in the order.
 
-- Every `Mount` has `arc`, `side: -1 | 0 | 1` (broadside port/starboard, 0 = either) and `trav: Traverse` =
-  `mountTraverse(sectionType, slotKind, partId, side)`: `{ arc, sectors: { c, h }[], layers, down }`. Sector angles are in SHIP space
+**Module grid.** Modules are placed on a grid (`Section.at` = [centre x from the keel line, forward y], design units, multiples of
+`GRID`), so a ship can be any joined shape: a single column, a wide hammerhead, outrigger batteries. `layoutOf(build)` gives every
+module's spot (`autoLayout` stacks a column when none is placed; a module without a spot goes astern on the keel line).
+`layoutIssue` refuses overlaps and modules that do not join the hull edge to edge; `canPlace`, `attachSpots`, `pinLayout` and
+`placeModule` / `canCutSection` (refitLogic.ts) keep the ship in one piece. `derive` centres the ship on its bounding box.
+
+**Facing.** Every weapon mount has a facing (`Facing` 0..7, 45° steps clockwise from the bow: 0 bow, 2 starboard, 4 stern, 6 port),
+stored per slot in `Section.face` (it belongs to the mount, not the part). `allowedFacings(type, i)`, `defaultFacing`,
+`mountFacing(section, i)`, `nextFacing` and `rotateMount` (refitLogic.ts) handle it.
+
+**Turret rings.** Every weapon mount has a ring level (`Section.ring`, 1..`RING_MAX` 3, `mountRing`); a refit (`upgradeRing`, scrap
+`ringCost(level)`: 60, then 140) widens the arc. Half-widths by level in `RING`: top deck 120° / 180° / 360°, sponson 90° / 130° /
+its whole side, bridge gun 70° / 100° / 140°. `TRAVERSE` is the standard ring.
+
+| Arc | Mounts | Facings | Traverse about the facing | Engages |
+| --- | --- | --- | --- | --- |
+| `bow` | Command Bridge | fore, fore-port, fore-starboard | `RING.bow`, clipped to the forward half | air and ground |
+| `dorsal` | Gun Deck turrets (top deck) | any | `RING.dorsal` | air only: they cannot depress below the hull |
+| `broadside` | Broadside Battery | outboard on its side: fore / abeam / aft quarter (the centre casemate either side) | `RING.broadside`, clipped to its own side | air and ground |
+| `ventral` | any bomb bay or mortar | ignored | falls (`down: true`) | ground only; a flying ghost is out of reach |
+| `omni` | point defense, arc coils | ignored | all round | PD: enemy fire (`shots`); coils: air from the top deck, air and ground elsewhere |
+
+**Ranges.** `RANGE` / `mountRange(arc, partId)` (also `Mount.range`): bridge gun 1000, top deck 720, broadside 760, bombs 420, mortars
+640, arc coils 240, point defense 200 field units.
+
+**Hull shadows.** `hullObstacles(rects)` lists what stands in the way: the bridge tower and engine funnels (tall: they block the bridge
+gun and top-deck turrets of other modules) and every module's hull (it blocks sponsons of other modules: a sponson cannot fire
+through the ship, so a module beside or ahead of a battery masks it).
+`hullShadows(trav, x, y, si, obstacles)` removes the bearings each obstacle subtends from the mount (a turret right behind the tower
+loses about ±31° dead ahead, one far aft only a few degrees), so sectors can come out in two pieces, and records them in
+`trav.blocked` (`{ c, h, by }`). `Derived.obstacles` keeps the list; `traverseIn(d, si, i, partId)` previews a part in a mount.
+
+- Every `Mount` has `facing`, `arc`, `side: -1 | 0 | 1` (broadside port/starboard from its facing; 0 for other arcs) and
+  `trav: Traverse` = `mountTraverse(sectionType, slotKind, partId, facing)` masked by `hullShadows`:
+  `{ arc, sectors: { c, h }[], layers, down, blocked }`. Sector angles are in SHIP space
   (radians, 0 = dead ahead, +PI/2 = starboard). `shipToField(a, mirrored)` / `fieldToShip` convert (the player's bow points up the
   screen, a ghost's down: `mirrored = true`), `inTraverse(trav, fieldAngle, mirrored)` tests a bearing and
   `clampTraverse(trav, fieldAngle, mirrored)` clamps one into the nearest sector. The ship renderer should clamp turret yaw with the same
   helpers. `layersHit(layers, enemyLayer)` decides what a mount may engage (a ghost dreadnought is layer `both`: air guns reach it,
   ground ordnance does not). `LAYERS_TAG` gives the HUD / refit tag (AIR, GND, ALL, PD). `placementNote(partId)` is the part slip line.
+- Ghosts carry facings (`GhostSections[].face`, validated 0..7 by `server/validate.mjs`; the client falls back to the default where a
+  facing is not allowed). Older ghosts without `face` get the defaults.
 - `ARC_INFO[arc]` gives `label`, `short`, `col` and `desc` for the UI. `positionArc(sectionType, slotKind)` is the arc a mount position
   gives (bridge bow, gun deck dorsal, battery broadside); `mountArc(sectionType, slotKind, partId)` the effective arc (bombs and mortars
   are always ventral, arc coils and PD omni).
-- Ranges (`ARC_RANGE` in combat.ts): bow 1000 inside its cone (bolts strafe ground targets; bow flak lobs shells at them); dorsal 720
-  all round, air only; broadside reaches 760 sideways for anything within half a hull length + 90 of the ship's y and inside its flank
-  sector, air or ground (ground targets get lobbed shells); mortars 520 around the ship; bomb bays drop under the hull. A battery with
-  nothing in its arc holds fire. Missiles and rails also respect the mount's layers (a top-deck pod only seeks aircraft).
+- Combat honours the masked traverse everywhere (`arcTarget(m, x, y)` in combat.ts returns `{ e, a }`: a target and a field bearing to
+  it inside `m.trav`, or null). A gun only picks targets with a bearing inside its sectors (for a ghost hull, any of its keel, beam or
+  centre points), prefers what lies near its facing (`OFF_FACING`), and every round, fan bolt and missile launch is clamped into the
+  traverse: an aft-angled sponson fires aft, a turret turned astern engages astern, and a bearing the hull blocks is never fired
+  through. With nothing to shoot a broadside round goes out along its facing (`restAngle`). Muzzles are the mount's real `ox, oy`
+  along the keel; rails start there. `blockedAt(trav, a)` tells a blocked bearing from one outside the arc.
+- Ranges are data (`RANGE` / `Mount.range` in parts.ts; `ARC_RANGE` in combat.ts is the same table): bow 1000, dorsal 720 (air only),
+  broadside 760 (ground targets get lobbed shells; bow flak lobs them too), mortars 640 and coils 240 from the mount, point defense 200,
+  bomb bays under the hull. A gun with nothing in its arc holds fire. Missiles and rails also respect the mount's layers.
 - Broadside cadence (`BROADSIDE`): each side fires one ripple volley about every 1.7 s, stern to bow, 35 ms between rounds; each gun packs
   `broadsideRounds(part)` rounds (period / cooldown, max 12) at 1.2x damage, +10% per extra gun on the side.
 - Enemy weapons have `range` (`EN[type].range`, measured to the hull by `hullDist`). Out-ranging them is the positional game.
@@ -120,7 +158,8 @@ Where a gun is mounted decides where it can point and what it can hit:
   ordnance hits the ground under that pixel). `fire` = left button (the selected group), `salvo` = right button (every group).
   `selectGroup(i)`, `cycleGroup(d)`, `firingGroups()`. Each frame `updateAim` sets `hover` (target under the reticle), the missile `lock`
   (target nearest the reticle within `MANUAL.lockR` 170, while a missile group is selected or salvoing) and per heavy mount
-  `why[uid]` = `heavyWhy(m, x, y, target)`: `''` (bears), `'arc'` (outside its traverse), `'range'` (ground ordnance beyond `reach`:
+  `why[uid]` = `heavyWhy(m, x, y, target)`: `''` (bears), `'arc'` (outside its facing's arc), `'blocked'` (inside it, but the ship's
+  own hull masks the bearing: `m.trav.blocked`), `'range'` (ground ordnance beyond `reach`:
   bombs 420, mortars 640 from the mount), `'air'` (a top-deck gun and the target is on the ground), `'ground'`. `bears[uid]` is `why === ''`.
 - Manual fire (`fireHeavy`): a loaded heavy gun whose group is pulled and that bears fires at `MANUAL.dmgMul` (1.1x, in place of the
   broadside ripple's 1.2x): rails along the line to the reticle (clamped to the traverse), missile pairs on the lock (or to the point,
@@ -131,12 +170,14 @@ Where a gun is mounted decides where it can point and what it can hit:
   select, `Q` / `E` and the wheel cycle (`uiSwitch`, or `uiError` when there is no such group); the system cursor hides over the field.
   Touch: drag steers, every gun aims itself. Space stays Overdrive. Hold Shift (or T to latch) for the FLIR thermal view.
 - HUD (`src/render/hud.ts`): bottom-left weapon panel with a numbered slot per heavy group (keycap, icon, AIR/GND/ALL tag, a reload pip
-  per mount, dimmed when it cannot bear, READY / n/m BEAR / NO BEARING) and an AUTO lamp bank; the reticle (brackets, reload ring per
-  mount, group tag, a slash and OUT OF ARC / OUT OF REACH / AIR ONLY when nothing bears, a dashed impact ring for ground ordnance and
-  the reach circles when out of reach, dashed firing lines from rails that bear and the traverse wedge of those that do not, closing lock
-  brackets for missiles, and a HOLD LMB prompt until the first heavy shot).
-- Ghost bosses keep their own fire control (`bossFire`, ghost broadsides) but train every gun inside its mount's traverse (mirrored):
-  the bridge gun in its cone, top-deck turrets all round (the player is an aircraft), broadsides in their flank sector.
+  per mount, dimmed when it cannot bear, READY / n/m BEAR / NO BEARING / BLOCKED) and an AUTO lamp bank; the reticle (brackets, reload
+  ring per mount, group tag, a slash and OUT OF ARC / BLOCKED / OUT OF REACH / AIR ONLY when nothing bears, a dashed impact ring for
+  ground ordnance and the reach circles when out of reach, dashed firing lines from rails that bear and, for those that do not, every
+  open sector of their masked traverse as a wedge drawn through the camera with the hull-blocked bearings in hostile red, closing lock
+  brackets for missiles, and a HOLD LMB prompt until the first heavy shot). Rear entries holding off the bottom edge show a pulsing
+  ASTERN double chevron with a fill bar (`asternWarnings`), one per group.
+- Ghost bosses keep their own fire control (`bossFire`, ghost broadsides) but train every gun inside its mount's recorded facing and
+  masked traverse (mirrored), and an aimed gun with no bearing on the player's hull holds fire (see "Ghost bosses").
 
 ### Events (`S.events`, `S.eventId`)
 Sim to audio/VFX/UI queue, capped at 160. Each `GameEvent` has an increasing `id`; consumers remember the last id they handled
@@ -145,7 +186,8 @@ Sim to audio/VFX/UI queue, capped at 160. Each `GameEvent` has an increasing `id
 `structure` (`n` scrap it paid), `carnageTier` (`n` new whole multiplier), `playerHit` (`n` damage).
 
 ### Overdrive (`S.overdrive`)
-`{ charge 0..1, active, kind, t (seconds left), dur, beam, trail, allies, radius }`. Space (`keys.od = true`, or `triggerOverdrive()`)
+`{ charge 0..1, active, kind, t (seconds left), dur, beam, extra, off, pulseT, ticks, trail, allies, radius }`. `extra[]` are upgrade
+beams drawn like `beam` (Twin Lances, a Spear Fan). Every number below is before the upgrade tree (`S.odm`, see "Overdrive upgrade tree"). Space (`keys.od = true`, or `triggerOverdrive()`)
 fires it when `charge >= 1`. Charge comes from kills (elites 0.5), structures and damage to a ghost. While active every battery fires 1.5x faster.
 Kinds (`OVERDRIVES` in `src/data/hulls.ts`):
 - `lance` Ventral Lance (Vanguard, 3.6 s): `beam = { x1, y1, x2, y2, w: 38, ground: true, col }` where (x1, y1) is the keel on the flight
@@ -160,6 +202,35 @@ Kinds (`OVERDRIVES` in `src/data/hulls.ts`):
 - `spear` Lance Spear (Lance, 2.6 s): `beam = { x1, y1 (bow), x2: x1, y2: -60, w: 54, ground: false }` on the flight plane. Deletes enemy shots in it.
 - `wing` Strike Wing (Leviathan, 7 s): `allies[]` = `{ x, y, vx, vy, hdg, cd, tg, t }`, eight strike craft on the flight plane. Their shots are normal `S.pb` bolts.
 - `bulwark` Bulwark Aegis (Bastion, 5 s): a 460-radius shockwave on activation, then `radius` > 0: an aegis around the hull that eats enemy shots; damage taken halved.
+
+### Overdrive upgrade tree (`src/data/overdriveTree.ts`, run.ts `takeOd`, `src/ui/screens/odTree.ts`)
+Every Overdrive refits along branching paths. Three tiers: tier 1 picks a **path** (2-3 nodes; taking one locks the others), tier 2
+offers two refits on that path (one locks the other), tier 3 is the path's capstone. Every tier-2/3 node `requires` its path's tier-1
+node; `odState(id, taken)` gives `taken | open | locked | later`, `openOdNodes`, `canTakeOd`, `sanitizeOd` (untrusted lists).
+Nodes carry typed effects (`OdFx`); `odMods(kind, taken)` folds them into `OdMods` = `{ dur, dmg, width, count, charge, mend, taken,
+follow, air, furrow, twin, skyburn, bombs, intercept, hold, sweep, finale, reflect, pulse, vacuum }`, which `startCombat` stores as
+`S.odm` (from `CombatSetup.odTree`). Combat reads only those fields:
+- Lance: **Sweep** (wider, `follow`: the ground point walks to the reticle, or the nearest ground target, `OD_SWEEP` 300 reach at
+  380/s; `beam.x2, y2` is that point) → Broad Swath / Burning Furrow (the trail keeps burning ground units) → Twin Lances (two more
+  beams `OD_TWIN.gap` either side, 60% damage). **Pierce** (narrower, 30% longer, burns aircraft within `OD_PIERCE` of the column) →
+  Hot Core / Long Burn → Skyburner (double air damage, enemy fire dies in the column).
+- Wing: **Swarm** (+4 craft) → Tight Formation / Long Patrol → Wolfpack (+4). **Heavy Bombers** (4 slower craft, `bomber: true`,
+  bomb ground targets first: S.pb `bomb` bolts, aoe 60·width) → Cluster Bombs / Second Sortie → Heavy Payload. **Interceptors** (the
+  craft hold a screen round the hull and shoot down enemy fire within 90·width, with S.beams tracer lines) → Wide Screen / Aces →
+  Quick Turnaround (charge ×1.4).
+- Spear: **Spear Fan** (1 + count beams `OD_FAN.step` 0.3 rad apart, in `beam` + `extra`, hits by segment distance) → Fivefold / Broad
+  Heads → Scythe (the fan sweeps ±0.35 rad). **Charge and Hold** (width swells 0.6 → 2.0 over the run, +30%) → Focus / Sustain → Nova
+  (as it ends the column detonates every 90 units).
+- Bulwark: **Reflect** (eaten shots come back as our bolts, `OD_REFLECT`) → Mirror / Wide Aegis → Riposte. **Long Watch** (×1.6 time,
+  40% damage taken) → Ironclad (30%) / Pulse (a 300-radius shockwave every 1.5 s, `OD_PULSE`) → Citadel. **Mend** (2.5% max hull/s,
+  times heat healing) → Damage Crews / Salvage Field (a vacuum on every scrap drop) → Phoenix.
+
+Earning picks (Spire-like): every sector boss banks a free **commission** (`run.odCredits`); the tree opens right after the trophy
+(Continue banks it) and from the map's Overdrive button, where only commissions can be spent. Scrap buys refits at a **drydock** (its
+one job: `OD_COST` 90 / 150 / 240 by tier) and at a **merchant** (times its price multiplier, any number). `takeOd(run, id, priceMul)`
+spends a commission first. Picks are per run (`run.od`, in order); ghosts do not record them (a ghost has no Overdrive).
+`tests/unit/overdriveTree.test.ts` holds the tree's shape and rules, the save migration, and that every node measurably changes a
+fixed proving-ground fight (`tests/sim/odScenario.ts`).
 
 ### Carnage (`S.carnage`) and scrap
 `{ value, mult 1..3, since, peak }` (`src/game/feel.ts`, `CARNAGE`). Kills and structures add value; after a 1.6 s grace it decays at
@@ -257,21 +328,35 @@ fields still answer for the ground). None allocates except `terrainAt` without `
 ### Enemies
 Besides `x, y, r, hp, maxHp, layer, type`: `hdg` heading (aircraft), `ang` turret aim, `tele` 0..1 wind-up before a shot (draw a growing hostile glint),
 `vx`. Enemy shots in `S.eb` carry `src` (who fired). Kinds unchanged: `bullet`, `orb`, `mine`, `missile`, `beam` (warn then fire), `strike` (growing ring).
+- **Threats from astern** (`AFT` in combat.ts): a share of director groups come up from behind the ship, so facings matter: interceptors
+  overtake up one side of the hull (`overtake`, one snap shot as they draw level with the stern), drone columns climb the field
+  (`dir: -1`), helicopters and gunships take station off an aft quarter (`quarter: side`, `quarterPoint`), and the ace holds an aft
+  quarter on 12% of its stations in sector 1, 28% from sector 3. Shares (jet 22%, drones 30%, helis 32%, gunships 38%) ramp in with
+  the level (`aftRamp`: ×0.35 in the first fights, full from level 3.5). A rear entry (`aft: true`) first holds off the bottom edge
+  (`AFT.y`, below the camera) for `AFT.warn` (1.3 s, `e.warnT` counts down; it neither moves nor fires nor is targeted), under the HUD's
+  ASTERN chevron. `spawnGroup(type, true)` forces rear entries. Ground units the ship has passed over keep firing aft while in range.
+- Elite hull by sector: `eliteSectorHp` (0.7 + 0.3 per sector, but 1.15 in sector 2). The carrier launches drones every 4.6 s and
+  fans every 3.3 s.
 
 ### Ghost bosses (`S.boss`, boss section of combat.ts)
 A ghost flies its recorded build (`ghostToBuild`), mirrored: its bow points down the screen, so a mount at design offset
 (ox, oy) sits at field (x + ox·s, y − oy·s). Every `BossGun` keeps its mount's `arc` and `side`:
-- non-broadside guns fire on their own cooldowns (`BOSS_CD`), aimed with `clampTraverse(gun.trav, ..., true)`: the bridge gun inside its
-  forward cone (straight down the screen), top-deck turrets all round;
+- every gun keeps its recorded facing and ring (`BossGun.facing`, masked `trav`) and fires only along a bearing on the player's hull
+  inside it (`bossGunBears`, using the keel, beam and centre points of our hull): **a ghost's blind arcs are safe water**. Bridge and
+  top-deck guns hold fire (stay loaded) while the player is outside their arcs; bridge and turret rails aim along their bearing
+  (`eb` beam with `x2, y2`). Muzzles sit on the real mounts along the keel (`bossGunPos`). Ghosts are drawn at most 440 long
+  (`s = min(1.6, 440 / len, 700 / width)`, `homeY = len·s/2 + 60`) so a long player hull keeps sea room beside and under them;
 - every ghost round is scaled by `bossHitEase()` = 2.6 / SHIP_SCALE (×0.85 more from sector 3): the scale pass made our hull a
   bigger target. Scripted pilot hull lost per boss: s1 32% / s2 60% / s3 70%;
 - ventral (bombs: mines; mortars: telegraphed strikes) and omni (arc coil rings, point defense) as before;
-- broadside lanes lock inside the flank sector (±`TRAVERSE.broadside` about the beam), and a flank engages when the player is inside it;
+- broadside lanes lock on each sponson's bearing to the player (`bossLock`), and a flank engages when at least one of its sponsons
+  bears (`bossFiring`; phase 3 fires every sponson, blind ones along the nearest edge of their arc). Rakes, weaves and the slow second
+  layer are clamped into each sponson's arc; slipping into its blind arc during the wind-up spoils the volley;
 - broadside guns fire **volleys** per flank (`B.volley[0]` port / screen left, `[1]` starboard): a flank whose arc holds the
   player winds up for `BOSS_BROADSIDE.tele[phase]` s (the FX layer draws `B.glints`: a hostile glint per gun and its lane,
   or the arc it will rake), then ripples stern to bow, `stagger` 75 ms per round. Rounds per gun `bossRounds(part, phase)`.
   Pulse fires twin-barrel pairs, scatter a 3-fan, flak an orb that bursts into 6, seekers a pair, rail a telegraphed beam
-  across the field (`eb` beam with `x2, y2`). Centre (either-side) guns join the flank the player is on.
+  across the field (`eb` beam with `x2, y2`). Every sponson has a side from its facing (the centre mount too).
 - Phases by hull (`BOSS_PHASES` 66% / 33%, notches on the HUD bar): 1 **lanes** (each gun's rounds on one locked line;
   the ghost sweeps the field), 2 **rake** (rounds sweep ±0.45 rad across the locked line with a 0.34 rad hole; the ghost
   comes about to hold the player on its beam, at about 85 units/s), 3 **full broadside** (both flanks every volley,
@@ -281,7 +366,10 @@ A ghost flies its recorded build (`ghostToBuild`), mirrored: its bow points down
   about to bring its broadsides to bear also takes ours, and early builds are broadside-heavy. Hull damage from its
   broadsides is tallied as `boss:broadside` in `S.stats.dmgBy` (rails `boss:broadside:rail`), bow, ventral and omni as `boss`.
 - Defense cores (`aiGhost`, no player ghost available) always carry a Broadside Battery behind the bridge, a second
-  from sector 3, with broadside-capable guns on its flanks.
+  from sector 3, with broadside-capable guns on its flanks, and deliberate facings (`AI_FACE`) and rings (`AI_RING`): sector 1 has
+  sponsons angled aft and turrets astern, so off its bow quarters (about 35-90° off its bow) nothing bears; sector 2 sponsons abeam,
+  one turret forward and one astern on wide rings; sector 3+ the fore battery angled forward, wide rings everywhere, full turret
+  rings from sector 4. Client ghost validation (`validGhost`) keeps recorded `face`, `ring` and `at`.
 
 ### Scrap economy (`tests/sim/economy.ts`, `tests/unit/economy.test.ts`)
 `BALANCE=1 npx vitest run tests/unit/economy.test.ts --disable-console-intercept` prints, per sector, the mean scrap of
@@ -322,9 +410,11 @@ picked up in combat, by 0.7; `tests/unit/repair.test.ts` holds the heat descript
 `kills, airKills, groundKills, elites, structures, broadsides, maxVolley, overdrives, lanceStructures, dmgTaken, dmgDealt, dmgToTarget,
 peakCarnage, scrapRaw, dmgBy{src: dmg}`. `S.seen` = kills per enemy type this fight (codex). main.ts folds them into `run.stats` / `run.seen`.
 
-### Run (`src/game/run.ts`, save v3)
-`RunState` adds `hull`, `heat`, `daily` (date key or null), `won`, `endless`, `phase: 'map' | 'victory'`, `odStart`, `seen`, and the wider
-`RunStats`. Saved under `gd.run.v3`; a `gd.run.v2` save migrates (`migrateRunSave`) to the Vanguard at heat 0. `CAMPAIGN_SECTORS = 3`:
+### Run (`src/game/run.ts`, save v4)
+`RunState` adds `hull`, `heat`, `daily` (date key or null), `won`, `endless`, `phase: 'map' | 'victory'`, `odStart`, `seen`, the wider
+`RunStats`, and the Overdrive tree: `od` (node ids, sanitized on load and filtered to the hull's Overdrive) and `odCredits` (banked
+commissions, 0..9). Saved under `gd.run.v4`; `migrateRunSave` steps v2 (to the Vanguard at heat 0) → v3 → v4 (no picks, one commission
+per boss already beaten); old `gd.run.v3` / `gd.run.v2` keys are still read. `CAMPAIGN_SECTORS = 3`:
 clearing sector 3 shows the victory screen; the pilot banks the run or pushes on into endless sectors.
 
 ### Profile and the fleet loop (`src/game/meta.ts`, `src/data/goals.ts`, `src/data/hulls.ts`, `src/data/heat.ts`)
@@ -355,7 +445,9 @@ clearing sector 3 shows the victory screen; the pilot banks the run or pushes on
 ### Balance harness
 `tests/sim/harness.ts` runs real fights headless with a scripted pilot and seeded `Math.random`. Bots: `pilot` (every gun aims
 itself), `gunner` (same flying, `gunnery.manual` on, the reticle on the boss / elite or the nearest target and every heavy group
-salvoing: what a mouse player does) and `idle`. A unit test holds the gunner's DPS within 0.85-1.6x of the pilot's. `BALANCE=1 npx vitest run
+salvoing: what a mouse player does) and `idle`. A unit test holds the gunner's mean DPS over four seeds within 0.85-1.6x of the
+pilot's (one fight swings about a quarter either way with threats from every bearing). The `s1end`, `mid` and `late` builds face their
+mounts and carry wide rings as a mid-run pilot would. `BALANCE=1 npx vitest run
 tests/unit/balance.test.ts --disable-console-intercept` prints the table (`ONLY=s2-boss,ace` narrows it).
 
 ### Debug hooks (`window.__gd`)
@@ -375,7 +467,10 @@ tests/unit/balance.test.ts --disable-console-intercept` prints the table (`ONLY=
   55% hull smoke from their first heat core (fire below 25%); wrecks stay hot for 22 s. Headlight beams, dust plumes, contrails, rotor
   discs and drop shadows are sized in metres. Effects use `fxs(v)` (half-size in metres with a floor).
 - **Tactical symbology** (`symbology.ts`, drawn by `drawHud` under the panels in one canvas pass, preallocated arrays): per contact a tracker
-  box (corner ticks round the unit's real footprint, never covering the unit) and a NATO-style symbol above it (ground diamond, air tent,
+  box (corner ticks round the unit's real footprint, never covering the unit) and a NATO-style symbol above it. Layer styles live in
+  `marks.ts` (pure, `tests/unit/marks.test.ts`): air = hostile red open tent with a bob and a dashed drop line to a pip on its shadow
+  (`SHADOW_DX/DY/ALT` in `scale.ts`, shared with the unit layer's drop shadow); ground = burnt amber filled diamond plus a ring decal;
+  salvage = dim scrap gold square. Symbol size by threat tier from `EN` (light / standard / heavy / elite). Frames (ground diamond, air tent,
   salvage square; glyphs for armour, infantry, AA, SAM, flak tower, rotary, fixed wing, UAV, bomber, carrier, crate, pod, wreck). Contacts
   larger than `BIG` get a designator (SAM, FLAK, BOMBER...), elites a double box. Out of weapon range = 60% alpha, under our hull = 30%.
   `tele` wind-up turns the contact pale and closes a ring on it. `aim.hover` / `aim.lock` = white lock box. Damaged = a health tick.
@@ -391,42 +486,54 @@ tests/unit/balance.test.ts --disable-console-intercept` prints the table (`ONLY=
 At true warship scale the guns are a few pixels on the hull, so the refit screen is an engineering callout drawing: the
 ship's plan (`drawBlueprint` with an explicit `fit`) on a blueprint sheet, and every mount called out by a leader line to a
 hand-sized, not-to-scale socket tile around it. Opened from the map (`#btn-refit`) and from the merchant's "Refit ship"
-service, which also passes the counter (`market`, `sections` getters on `RefitExtras`).
-- **Layout** (`layoutBoard`, pure): bow mount tile above the ship, port mounts (`ox < 0`) in the left column, starboard in the
-  right, centreline mounts to the shorter column. Tiles sit level with their mount where they can (`resolve1D` spreads
-  them in order inside the column), shrinking to 40 px when a column is crowded (`compact`). Anchors are where the mount is
-  drawn (`mountDrawPos` in `shipPreview.ts`: broadside guns sit on their sponsons). Leaders run tile edge -> stub ->
-  diagonal across the gutter -> level run over the hull -> mount; the diagonals share two vertical lines in the same order
-  as the level runs, so a column's leaders cannot cross. Mounts level with each other (a battery's flank gun and centre
-  bay) get runs `LEVEL_STEP` (15 px) apart. Below `STACK_BELOW` (640 px board width, phones) it stacks: ship on top with
-  numbered balloons, numbered tiles listed under it. `tests/unit/refitBoard.test.ts` holds every hull and the worst
-  8-section builds at four board sizes to: tiles in bounds, no overlaps, zero crossings, no leader through a tile, sides correct.
-- **Moves** (pure): `Src` = hold / mount / counter, `Dst` = mount / hold. `checkMove` gives `ok` or a refusal (`kind`: wrong slot
-  kind, `scrap`: counter part not affordable, `same`, `noop`) with the reason shown on the socket; `applyMove` swaps mount to
-  mount, sends a replaced part to the hold, unmounts to the hold; `previewMove` returns the build a move would leave. Sections:
-  `canMoveSection` / `moveSection` (insert; the bridge stays at the bow), `canCutSection` / `cutSection` (parts to the hold).
-  The board applies every one inside `changeBuild(run, ...)` exactly as the old refit did; counter parts are bought with the
-  merchant's own purchase function (`buyPart` in main.ts: scrap, sold flag, part into the hold) and then moved from the hold.
-- **Preview**: while a part is picked or carried, every socket gets `.cand` (lit, with the arc tag and target layers the part
-  would get there from `mountTraverse`, and its top stat deltas) or `.nope` (dimmed, with the reason). The socket under the
-  pointer draws the firing-arc wedge on the plan (ventral ordnance: drop rings), redraws the ship with the previewed build and
-  shows `statDeltas` in the particulars panel (hull, speed, fire rate, shield, rated anti-air / anti-ground dmg/s from
-  `firepower()`, mass, thrust, PD, repair, drones). A section drag redraws the reordered hull at its own fit.
-- **Drag** (`draggable(el, hooks)`): pointer events, one path for mouse, pen and touch. Mouse/pen start after 6 px of travel,
-  a finger after a 260 ms press-and-hold (a quick swipe still scrolls). Targets are `[data-drop]` elements
-  (`slot:<si>:<i>`, `hold`, `sec:<i>`, `cut`); the carried tile is a clone hung below-right of the pointer (so the socket under it stays
-  readable) that snaps into the target (150 ms overshoot) or springs back. Edge auto-scroll while carrying (phones: hold below the board). Escape cancels. The board does not re-render
-  mid-drag (`dragging()`).
-- **Feedback**: landing plays `uiSound('stamp')` (a counter purchase `'buy'`), the socket does a clunk (scale overshoot and a
-  well flash) and its leader and ring flash; refused drops `'deny'` and wobble. Gauges rebuild only when the committed fit
-  changes, so needles swing once per refit.
-- **Click and keyboard**: click (or Enter) a hold part to pick it, then a socket to place it; click a mounted part to pick it
-  up, then another socket to swap or "Return to hold"; Delete unmounts the focused socket; Esc lets go. Sections also keep
-  their ▲ ▼ buttons and guarded Cut switch; dropping a section in the cut bin asks for confirmation.
-- Screenshots: `docs/shots/ui-refit-*.jpg` (board idle, drag over a lit / refused socket, equipped, swap, section drag,
-  merchant counter, an 8-section build, phone).
-- Hooks for tests: `.mtile[data-slot="si-i"]` (`.cand`, `.nope`, `.over`), `[data-inv]`, `[data-mkt]`, `.rf-hold`,
-  `li.sec[data-sec]`, `.rf-toast`, `.board-lines .lead` / `.arc-w.hot`.
+service, which also passes the counter (`market`, `sections` getters on `RefitExtras`; `rings` allows turret ring refits,
+default: when a counter came along). Position, facing, ring and shape are the strategy; the board shows all four.
+- **Plan** (`shipPreview.ts`): a ship of any grid shape. The outline is the union of every module's hull proper, a clipper bow
+  on every module whose bow is open, a stern taper on every open stern (`planExtent` = how far they reach past the bounding
+  box) and battery sponsons (`drawnObstacles`). Module seams are dashed (each module is a block you can move); the bridge
+  tower and funnels are raised (shadow, hatching, dashed outline: they mask fire). Mounts are drawn where they sit and turned
+  to their facing.
+- **Layout** (`layoutBoard`, pure, `anchorsFor(d)`): the bridge gun's tile goes above the ship only when it is the foremost
+  mount; port mounts (`ox < -1`) left, starboard right, centreline mounts to the shorter column. Tiles sit level with their
+  mount (`resolve1D`), shrinking to 40 px when crowded (`compact`). Leaders: tile edge -> stub -> diagonal across the gutter ->
+  level run over the hull -> mount, so a column's leaders cannot cross; mounts level with each other get runs `LEVEL_STEP`
+  apart. Below `STACK_BELOW` (640 px, phones) it stacks. `tests/unit/refitBoard.test.ts` holds every hull, column, hammerhead,
+  outrigger and wide eight-module builds at four sizes to: tiles in bounds, no overlaps, zero crossings, no leader through a
+  tile, sides correct, the whole plan (bow and stern) on the sheet.
+- **Arcs and reach**: every gun whose facing matters draws its masked arc (`arcView`: open sectors, and blocked wedges clipped
+  to its arc, hatched red and on the hot mount labelled BRIDGE TOWER / FUNNEL / SPONSON / ... via `BLOCK_NAME`). Fan radius is
+  the gun's reach (`Mount.range`) on one common range scale (`rangeK`: true reach would cover the sheet); the hovered mount's
+  fan is at full reach with a dashed range ring and the number, the others at 42%. Ventral ordnance draws its ground reach
+  rings. Tiles show the range (`⌖720`).
+- **Facing**: each weapon tile has a rotate strip (⟳ / facing "FS↗" and turret ring pips / ⟲); R / Shift+R or the wheel over a
+  mount (tile or plan) turn it (`rotateMount`). Bombs, mortars and all-round weapons refuse with the reason (`rotateWhy`).
+- **Turret rings**: the hovered or focused socket shows a ring chip ("RING II · 60¤"); hovering previews the wider arc and the
+  compare card, click or U buys it (`ringUpgradeCost`, `upgradeRing`, scrap off `run.scrap`) where `rings` is allowed.
+- **Module grid**: drag a module on the plan (grab it away from its guns), from the module list, or a new module from a work
+  slip on the counter. While carried the plan holds still in the frame the drag started in (`planOffset`, `spotAt`,
+  `spotBox`), every legal spot shows as a ghost outline (`placeSpots`: `attachSpots` + `placeIssue`), the drop snaps to the
+  nearest within 16 design units (`dropSpot`) or shows red with the reason, and the plan, every arc, the rose and the stats
+  preview the reshaped ship (`previewPlacing`). A drop commits through `placeModule` (a counter module is bought first, then
+  placed; `addSection` puts it astern where it joins). The list keeps ◀ ▲ ▼ ▶ nudges and arrow keys on a focused row
+  (`nudgeSpot`: the next legal spot that way), the guarded Cut switch and the cut bin.
+- **Compare card** (`.rf-cmp`, top of the particulars): whenever something is being tried (a part over a socket, a rotate or
+  ring button hovered, a module over a spot) it lists NOW vs NEW with green / red changes: the mount (`mountCard`: part, air
+  and ground dmg/s, cooldown, range, clear arc after blocking, engages, ring) and the ship (`shipCard`: hull, speed, anti-air,
+  anti-ground, worst coverage gap).
+- **Coverage rose**: dmg/s bearing on each of `ROSE_BINS` bearings (`coverage`), air and ground, around a ship glyph, the four
+  quarters' means, and the worst gap called out (`weakestQuarter`: BLIND / NO AA / NO GROUND FIRE + quarter, else THINNEST).
+- **Moves** (pure): `Src` = hold / mount / counter, `Dst` = mount / hold; `checkMove` (refusals `kind`, `scrap`, `same`, `noop`),
+  `applyMove`, `previewMove`; `canCutSection` keeps the hull joined. Every change goes through `changeBuild(run, ...)`.
+- **Drag** (`draggable(el, hooks)`): pointer events, one path for mouse, pen and touch (finger: 260 ms hold). Targets are
+  `[data-drop]` (`slot:<si>:<i>`, `hold`, `cut`); hooks may add `move(x, y)` (spot drops) and `snapTo()` (where a committed
+  drop snaps); a ghost with `data-own-size` keeps its size. Escape cancels; the board does not re-render mid-drag.
+- **Click and keyboard**: click (or Enter) a hold part, then a socket; Delete unmounts the focused socket; Esc lets go; R / U on
+  the focused or hovered mount; arrows on a focused module row.
+- Screenshots: `docs/shots/ui-refit-grid-*.jpg` (hammerhead, module drag, outrigger, ring compare, part compare, counter
+  weld), `ui-refit-facing-*.jpg`, older `ui-refit-*.jpg`.
+- Hooks for tests: `.mtile[data-slot="si-i"]` (`.cand`, `.nope`, `.over`), `.mslot[data-mslot]` (`.rot-cw`, `.rot-ccw`,
+  `.ring-chip`), `[data-inv]`, `[data-mkt]`, `.rf-hold`, `li.sec[data-sec]`, `.wslip[data-weld]`, `.rf-cmp`, `.rf-toast`,
+  `.board-lines .lead` / `.arc-w.hot` / `.spot` / `.spot-on`.
 
 ## Ship rendering (`src/render/ship/`)
 - `hull.ts` builds a hull at the reference scale (`SHIP_SCALE` 2.6) and scales a `body` group by `SHIP_SCALE / 2.6`, so every detail keeps its proportion if the ship scale changes. Layer-facing points (`nozzles`, `vents`, `dmgPts`) are in root space; turret pivots are in body space (`model.k`).

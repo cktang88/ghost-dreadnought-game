@@ -4,11 +4,11 @@
 // reticle (impact ring, rail lines, missile lock brackets, reload ring, why a group cannot bear), the Overdrive gauge (with a SPACE prompt that cannot be missed),
 // the carnage ladder, a boss/elite nameplate, a stamped banner, a slow-mo letterbox and off-screen threat chevrons
 // (ported from Dead Air's threat-indicators.js). Reads S.overdrive, S.carnage, S.events, S.pickStreak, S.slowFx.
-import { S, W, H, BOSS_PHASES, aim, gunnery, firingGroups } from '../game/combat';
+import { S, W, H, BOSS_PHASES, AFT, aim, gunnery, firingGroups } from '../game/combat';
 import { V } from '../game/vfx';
 import { clamp } from '../util/rng';
 import { EN } from '../data/enemies';
-import { wCd, autoMounts, LAYERS_TAG, type Part, type Mount } from '../data/parts';
+import { wCd, autoMounts, LAYERS_TAG, shipToField, type Part, type Mount, type Sector } from '../data/parts';
 import { OVERDRIVES, type OverdriveKind } from '../data/hulls';
 import { drawIcon } from '../ui/icons';
 import { fieldToScreen, screenScale } from './view';
@@ -263,9 +263,11 @@ function weapons(c: CanvasRenderingContext2D) {
       reloadPip(c, sx + 40 + mi * 18, sy + 40, 6, bears ? g.def.col : '#5d6e7e', r.ready, r.flash);
     });
     const nb = g.mounts.filter((m) => aim.bears[m.part!.uid] !== false).length;
-    const state = !manual ? 'AUTO' : nb === g.mounts.length ? 'READY' : nb ? `${nb}/${g.mounts.length} BEAR` : 'NO BEARING';
+    // NO BEARING, or BLOCKED when the ship's own hull masks the bearing for every mount in the group
+    const blocked = g.mounts.every((m) => aim.why[m.part!.uid] === 'blocked');
+    const state = !manual ? 'AUTO' : nb === g.mounts.length ? 'READY' : nb ? `${nb}/${g.mounts.length} BEAR` : blocked ? 'BLOCKED' : 'NO BEARING';
     label(c, `×${g.mounts.length}`, sx + SLOT_W - 8, sy + 44, C.dim, 10, 'right');
-    label(c, state, sx + 8, sy + SLOT_H - 7, state === 'NO BEARING' ? C.hazard : act ? C.dim : C.faint, 9);
+    label(c, state, sx + 8, sy + SLOT_H - 7, state === 'NO BEARING' || state === 'BLOCKED' ? C.hazard : act ? C.dim : C.faint, 9);
   });
   if (autos.length) {
     const ax = x + 12 + groups.length * (SLOT_W + 8), ay = y + 24;
@@ -288,7 +290,15 @@ function weapons(c: CanvasRenderingContext2D) {
 }
 
 /* ---------------- the reticle: where the heavy groups will land ---------------- */
-const WHY_TEXT: Record<string, string> = { arc: 'OUT OF ARC', range: 'OUT OF REACH', air: 'AIR ONLY', ground: 'GROUND ONLY' };
+const WHY_TEXT: Record<string, string> = { arc: 'OUT OF ARC', blocked: 'BLOCKED', range: 'OUT OF REACH', air: 'AIR ONLY', ground: 'GROUND ONLY' };
+/** A traverse sector (ship space) as a wedge from field point (x, y) out to radius R, through the camera (so a masked
+ *  arc in two pieces draws as two wedges, and the hull's shadow between them as its own). */
+function wedge(c: CanvasRenderingContext2D, x: number, y: number, sct: Sector, R: number) {
+  const a0 = shipToField(sct.c - sct.h), n = Math.max(3, Math.ceil(sct.h * 10));
+  const o = fieldToScreen(x, y); c.beginPath(); c.moveTo(o.x, o.y);
+  for (let i = 0; i <= n; i++) { const a = a0 + (2 * sct.h * i) / n, q = fieldToScreen(x + Math.cos(a) * R, y + Math.sin(a) * R); c.lineTo(q.x, q.y); }
+  c.closePath();
+}
 function brackets(c: CanvasRenderingContext2D, x: number, y: number, r: number, len: number) {
   for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
     c.beginPath(); c.moveTo(x + sx * r, y + sy * (r - len)); c.lineTo(x + sx * r, y + sy * r); c.lineTo(x + sx * (r - len), y + sy * r); c.stroke();
@@ -322,15 +332,18 @@ function reticle(c: CanvasRenderingContext2D) {
     }
     c.globalAlpha = 1;
   }
-  // rails: a firing line from every gun that bears; the traverse wedge of those that do not
+  // rails: a firing line from every gun that bears; the masked traverse of those that do not (every open sector, and the
+  // bearings the hull blocks in hostile red)
   for (const g of act) if (g.def.aim === 'line') for (const m of g.mounts) {
-    const mp = fieldToScreen(P.x + m.ox, P.y + m.oy), mx = mp.x, my = mp.y;
+    const mx0 = P.x + m.ox, my0 = P.y + m.oy, mp = fieldToScreen(mx0, my0), mx = mp.x, my = mp.y;
     if (aim.bears[m.part!.uid] !== false) {
       c.strokeStyle = g.def.col; c.globalAlpha = pulling ? 0.7 : 0.35; c.lineWidth = 1.2; c.setLineDash([10, 6]); c.lineDashOffset = -st.t * 60;
       c.beginPath(); c.moveTo(mx, my); c.lineTo(x, y); c.stroke(); c.setLineDash([]);
     } else {
-      c.globalAlpha = 0.12; c.fillStyle = g.def.col;
-      for (const sct of m.trav.sectors) { const a0 = sct.c - sct.h - Math.PI / 2, a1 = sct.c + sct.h - Math.PI / 2; c.beginPath(); c.moveTo(mx, my); c.arc(mx, my, 260, a0, a1); c.closePath(); c.fill(); }
+      c.fillStyle = g.def.col; c.globalAlpha = 0.12;
+      for (const sct of m.trav.sectors) { wedge(c, mx0, my0, sct, 260); c.fill(); }
+      c.fillStyle = C.hostile; c.globalAlpha = aim.why[m.part!.uid] === 'blocked' ? 0.22 : 0.1;
+      for (const sct of m.trav.blocked) { wedge(c, mx0, my0, sct, 200); c.fill(); }
     }
     c.globalAlpha = 1;
   }
@@ -489,10 +502,36 @@ function edgeAnchor(ang: number, l: number, t: number, r: number, b: number) {
   const k = Math.min(Math.abs(cs) < 1e-6 ? Infinity : hx / Math.abs(cs), Math.abs(sn) < 1e-6 ? Infinity : hy / Math.abs(sn));
   return { x: cx + cs * k, y: cy + sn * k };
 }
+/** Rear entries holding off the bottom edge (e.warnT): a pulsing double chevron where they will break in, marked ASTERN,
+ *  with a bar that fills as they come. One marker per group. */
+function asternWarnings(c: CanvasRenderingContext2D) {
+  const marks: { x: number; k: number }[] = [];
+  for (const e of S.enemies) {
+    if (e.dead || !(e.warnT > 0)) continue;
+    const x = clamp(fieldToScreen(clamp(e.x, 30, W - 30), H).x, 46, W - 46), k = 1 - e.warnT / AFT.warn;
+    const m = marks.find((q) => Math.abs(q.x - x) < 90);
+    if (m) m.k = Math.max(m.k, k); else marks.push({ x, k });
+  }
+  if (!marks.length) return;
+  const pulse = 0.5 + 0.5 * Math.sin(st.t * 16);
+  c.save();
+  for (const m of marks) {
+    const y = H - 46;
+    c.save(); c.translate(m.x, y); c.globalAlpha = 0.6 + 0.4 * pulse;
+    c.fillStyle = C.hostile; c.strokeStyle = 'rgba(10,14,19,.9)'; c.lineWidth = 2; c.lineJoin = 'round';
+    for (const dy of [0, 11]) { c.beginPath(); c.moveTo(0, -12 + dy - pulse * 3); c.lineTo(13, 2 + dy); c.lineTo(6, 2 + dy); c.lineTo(0, -4 + dy); c.lineTo(-6, 2 + dy); c.lineTo(-13, 2 + dy); c.closePath(); c.stroke(); c.fill(); }
+    c.restore();
+    label(c, 'ASTERN', m.x, y - 22, C.hostile, 11, 'center');
+    c.fillStyle = 'rgba(8,10,13,.7)'; c.fillRect(m.x - 24, y + 18, 48, 4);
+    c.fillStyle = C.hostile; c.fillRect(m.x - 24, y + 18, 48 * m.k, 4);
+  }
+  c.restore();
+}
 function threats(c: CanvasRenderingContext2D) {
+  asternWarnings(c);
   const list: { x: number; y: number; big: boolean }[] = [];
   for (const e of S.enemies) {
-    if (e.dead || e.hp <= 0 || EN[e.type]?.salvage) continue;
+    if (e.dead || e.hp <= 0 || EN[e.type]?.salvage || e.warnT > 0) continue;
     if (e.x > -8 && e.x < W + 8 && e.y > -8 && e.y < H + 8) continue;
     if (e.x < -320 || e.x > W + 320 || e.y < -320 || e.y > H + 320) continue;
     list.push({ x: e.x, y: e.y, big: !!EN[e.type]?.elite });

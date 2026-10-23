@@ -21,7 +21,7 @@ import { liveryUniforms, GROUND_LIFT } from './livery';
 import { buildSpecs, type UnitSpec, type PartDef } from './specs';
 import { Particles, PK } from './particles';
 import type { InstPool } from './pool';
-import { SCALE_STATE } from './scale';
+import { SCALE_STATE, SHADOW_DX, SHADOW_DY, SHADOW_ALT } from './scale';
 import { FLIR } from '../flir';
 
 const TAU = Math.PI * 2;
@@ -58,8 +58,6 @@ const C = {
  * Lights get a floor in screen units so a lamp stays a point of light at any size: LIGHT_MIN[kind] screen units.
  */
 const LIGHT_MIN: Record<string, number> = { port: 2.6, stbd: 2.6, strobe: 3.2, beacon: 3, engine: 3.4, head: 2.2, scrap: 6, deck: 1.6, heat: 3.2 };
-/** Air units' drop shadows land this far (field units) down-right of them: the moon is up-left. */
-const SHADOW_DX = 34, SHADOW_DY = 44;
 const ease = (t: number) => 1 - Math.pow(1 - Math.min(1, Math.max(0, t)), 3);
 const wrap = (a: number) => { while (a > Math.PI) a -= TAU; while (a < -Math.PI) a += TAU; return a; };
 const slew = (a: number, b: number, rate: number) => { const d = wrap(b - a); return a + Math.max(-rate, Math.min(rate, d)); };
@@ -443,7 +441,7 @@ export class UnitLayer implements Layer {
     if (!air) this.gq(e.dark, vpos.x, 1.5, vpos.z, fwdYaw, halo, halo, C.shadow, 0.6 * fade, DarkShape.Soft);
     else {
       this.gq(e.dark, vpos.x, vpos.y - 8, vpos.z, 0, halo, halo, C.shadow, 0.45 * fade, DarkShape.Soft);
-      const sh = 1 - v.alt / 900;
+      const sh = 1 - v.alt / SHADOW_ALT;
       if (sh > 0) {
         e.toGround(v.x + SHADOW_DX, v.y + SHADOW_DY, vb);
         const ss = spec.size * s;

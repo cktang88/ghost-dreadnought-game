@@ -1,5 +1,5 @@
 // Client for the ghost registry. Falls back to ghosts stored on this device if the server is unreachable.
-import { WEAPONS, UTILS, SECTIONS, MAX_SECTIONS, type GhostSections, type SectionType } from '../data/parts';
+import { WEAPONS, UTILS, SECTIONS, MAX_SECTIONS, RING_MAX, type GhostSections, type SectionType } from '../data/parts';
 import { has, pick, rint } from '../util/rng';
 
 export interface Ghost { id: string; pilot: string; name: string; sector: number; floor: number; sections: GhostSections; relics: string[]; score: number; ai?: boolean }
@@ -15,8 +15,13 @@ export function validGhost(g: any): Ghost | null {
   for (const s of g.sections) {
     if (!s || !has(SECTIONS, s.type)) return null;
     const kinds = SECTIONS[s.type as SectionType].slots;
+    // recorded mount facings (0..7); ghostToBuild drops any a mount cannot take
+    const face = Array.isArray(s.face) ? { face: kinds.map((_, i) => { const f = Number(s.face[i]); return Number.isInteger(f) && f >= 0 && f < 8 ? f : 0; }) } : {};
+    // turret rings (1..RING_MAX) and the grid position; ghostToBuild re-checks the layout is one joined hull
+    const ring = Array.isArray(s.ring) ? { ring: kinds.map((_, i) => { const r = Number(s.ring[i]); return Number.isInteger(r) && r >= 1 && r <= RING_MAX ? r : 1; }) } : {};
+    const at = Array.isArray(s.at) && s.at.length === 2 && s.at.every((v: unknown) => Number.isFinite(Number(v)) && Math.abs(Number(v)) < 400) ? { at: [Number(s.at[0]), Number(s.at[1])] as [number, number] } : {};
     sections.push({
-      type: s.type,
+      type: s.type, ...face, ...ring, ...at,
       slots: kinds.map((k, i) => {
         const v = Array.isArray(s.slots) ? s.slots[i] : null;
         if (!Array.isArray(v)) return null;
@@ -72,6 +77,25 @@ export async function submitGhost(g: Ghost): Promise<'shared' | 'local'> {
 }
 
 const AI_NAMES = ['IRON WARDEN', 'HOLLOW REGENT', 'CINDER MATRON', 'GREY TITHE', 'LAST BASTION', 'PALE ARBITER', 'RUST SOVEREIGN', 'NULL CHOIR'];
+/**
+ * Defense core mount facings and turret rings, by sector. A ghost's guns hold fire while the player is outside their
+ * arcs (it is mirrored: its bow points down the screen, its stern up), so a core can leave a hole in its cover:
+ *  - sector 1: sponsons angled aft, turrets astern, standard rings. Off its bow quarters (about 35-90 degrees
+ *    off its bow, between the bridge gun's cone and the sponsons'), nothing bears.
+ *  - sector 2: sponsons abeam, one turret forward and one astern on wide rings: covered all round but for the hull's
+ *    own shadows.
+ *  - sector 3+: the fore battery angled forward, the aft one abeam, wide rings everywhere; full turret rings from 4.
+ * Battery mounts are [port, centre, starboard]; gun decks [fore, aft].
+ */
+const AI_FACE = (sector: number, type: SectionType, nth: number): number[] | undefined => {
+  if (type === 'battery') return sector <= 1 ? [5, 6, 3] : sector >= 3 && nth === 0 ? [7, 6, 1] : [6, 2, 2];
+  if (type === 'gundeck') return sector <= 1 ? [4, 4] : [0, 4];
+  return undefined;
+};
+const AI_RING = (sector: number, type: SectionType): number => {
+  if (type === 'gundeck') return sector >= 4 ? 3 : sector >= 2 ? 2 : 1;
+  return (type === 'battery' || type === 'bridge') && sector >= 3 ? 2 : 1;
+};
 export function aiGhost(sector: number): Ghost {
   const n = Math.min(MAX_SECTIONS, 3 + sector);
   // Every defense core is a dreadnought: a Broadside Battery right behind the bridge, a second one from sector 3.
@@ -80,10 +104,13 @@ export function aiGhost(sector: number): Ghost {
   const wids = Object.keys(WEAPONS).filter((k) => k !== 'pd'), uids = Object.keys(UTILS);
   /** Flank mounts of a battery get guns that can fire a broadside; its centre may be anything. */
   const sideGuns = ['pulse', 'pulse', 'spread', 'flak', 'missile', 'rail'];
-  const sections: GhostSections = [{ type: 'bridge', slots: [['pulse', maxT]] }];
+  const rings = (type: SectionType) => SECTIONS[type].slots.map(() => AI_RING(sector, type));
+  const sections: GhostSections = [{ type: 'bridge', slots: [['pulse', maxT]], face: [0], ring: rings('bridge') }];
+  const seen: Partial<Record<SectionType, number>> = {};
   for (let i = 1; i < n; i++) {
-    const type = order[(i - 1) % order.length];
-    sections.push({ type, slots: SECTIONS[type].slots.map((k, j) => [k === 'W' ? pick(type === 'battery' && j !== 1 ? sideGuns : wids) : pick(uids), rint(Math.max(1, maxT - 1), maxT)] as [string, number]) });
+    const type = order[(i - 1) % order.length], nth = seen[type] ?? 0, face = AI_FACE(sector, type, nth);
+    seen[type] = nth + 1;
+    sections.push({ type, slots: SECTIONS[type].slots.map((k, j) => [k === 'W' ? pick(type === 'battery' && j !== 1 ? sideGuns : wids) : pick(uids), rint(Math.max(1, maxT - 1), maxT)] as [string, number]), ...(face ? { face } : {}), ring: rings(type) });
   }
   return { id: `ai-${sector}`, pilot: 'ai', name: AI_NAMES[(sector - 1) % AI_NAMES.length], sector, floor: 10, sections, relics: [], score: 0, ai: true };
 }

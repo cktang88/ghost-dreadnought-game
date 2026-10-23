@@ -31,6 +31,8 @@ function job(o: { id?: string; title: string; detail: string; hours: string; dis
 export interface DrydockOpts {
   run: RunState; healAmt: number; canRepair: boolean; onRepair: () => void; onUpgrade: () => void;
   welds: { name: string; type: string; detail: string; disabled: boolean; act: () => void }[];
+  /** The Overdrive refit job (one tree node, for scrap or a commission). */
+  overdrive?: { name: string; detail: string; disabled: boolean; act: () => void };
 }
 export function drydockView(o: DrydockOpts) {
   return frame(o.run, { screen: 'drydock', kind: 'order', eyebrow: 'Safe harbor', title: 'Drydock', glyph: 'auto-repair', cls: 'orders' },
@@ -40,6 +42,7 @@ export function drydockView(o: DrydockOpts) {
       el('div', 'jobs',
         job({ id: 'dock-repair', title: 'Repair', detail: o.canRepair ? `Restore ${o.healAmt} hull.` : 'Hull is at full strength.', hours: '40 h', disabled: !o.canRepair, icon: 'auto-repair', act: o.onRepair }),
         job({ id: 'dock-upgrade', title: 'Upgrade', detail: 'Raise one part by a tier.', hours: '26 h', icon: 'anvil-impact', act: o.onUpgrade }),
+        o.overdrive ? job({ id: 'dock-overdrive', title: `Overdrive refit: ${o.overdrive.name}`, detail: o.overdrive.detail, hours: '48 h', disabled: o.overdrive.disabled, icon: 'power-lightning', act: o.overdrive.act }) : null,
         ...o.welds.map((w) => job({ title: `Weld on a ${w.name}`, detail: w.detail, hours: '60 h', disabled: w.disabled, icon: w.type, act: w.act })),
       ),
       el('div', 'sign', el('span', null, 'Yard master'), el('i'), el('span', null, 'Commanding officer'), el('i')),
